@@ -1,0 +1,2771 @@
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import { Analytics } from '@vercel/analytics/react';
+import { Startup, NewInvestment, ComplianceStatus, StartupAdditionRequest, FundraisingDetails, InvestmentRecord, InvestmentType, UserRole, Founder, User, VerificationRequest, InvestmentOffer } from './types';
+import { authService, AuthUser } from './lib/auth';
+import { startupService, investmentService, verificationService, userService, realtimeService, startupAdditionService } from './lib/database';
+import { caService } from './lib/caService';
+import { csService } from './lib/csService';
+import { dataMigrationService } from './lib/dataMigration';
+import { storageService } from './lib/storage';
+import { validationService, ValidationRequest } from './lib/validationService';
+import { supabase } from './lib/supabase';
+import InvestorView from './components/InvestorView';
+import StartupHealthView from './components/StartupHealthView';
+import AdminView from './components/AdminView';
+import CAView from './components/CAView';
+import CSView from './components/CSView';
+import FacilitatorView from './components/FacilitatorView';
+import InvestmentAdvisorView from './components/InvestmentAdvisorView';
+import LoginPage from './components/LoginPage';
+import { TwoStepRegistration } from './components/TwoStepRegistration';
+import { CompleteRegistrationPage } from './components/CompleteRegistrationPage';
+import ResetPasswordPage from './components/ResetPasswordPage';
+// LandingPage removed
+import { getQueryParam, setQueryParam } from './lib/urlState';
+import Footer from './components/Footer';
+import PageRouter from './components/PageRouter';
+import PublicProgramView from './components/PublicProgramView';
+import DiagnosticPage from './components/DiagnosticPage';
+
+import { Briefcase, BarChart3, LogOut } from 'lucide-react';
+import LogoTMS from './components/public/logoTMS.svg';
+import { FacilitatorCodeDisplay } from './components/FacilitatorCodeDisplay';
+import MessageContainer from './components/MessageContainer';
+import { messageService } from './lib/messageService';
+import { cookieUtils } from './lib/utils/cookieUtils';
+import { withRetry, handleError } from './lib/utils/errorHandler';
+import { requestCache } from './lib/utils/requestCache';
+import { fetchRoleBasedData } from './lib/utils/roleBasedDataFetcher';
+import { createVisibilityAwareWatchdog } from './lib/utils/visibilityAwareRetry';
+
+const App: React.FC = () => {
+  // Check if we're on a standalone page (footer links)
+  const standalonePages = ['/privacy-policy', '/terms-conditions', '/about', '/contact', '/diagnostic'];
+  const currentPath = window.location.pathname;
+  
+  // Check if we're on a public program view page
+  const isPublicProgramView = getQueryParam('view') === 'program' && getQueryParam('opportunityId');
+  
+  
+  
+  if (standalonePages.includes(currentPath)) {
+    return (
+      <div className="min-h-screen bg-slate-100 flex flex-col">
+        <main className="flex-1">
+          <PageRouter />
+        </main>
+      </div>
+    );
+  }
+
+
+  // Use optimized cookie utilities
+  const setCookie = cookieUtils.set;
+  const getCookie = cookieUtils.get;
+  const deleteCookie = cookieUtils.delete;
+
+  // Initialize view from cookie or default to dashboard
+  const [view, setView] = useState<'startupHealth' | 'dashboard'>(() => {
+    const savedView = getCookie('currentView');
+    return (savedView === 'startupHealth' || savedView === 'dashboard') ? savedView : 'dashboard';
+  });
+  const [viewKey, setViewKey] = useState(0); // Force re-render key
+  const [forceRender, setForceRender] = useState(0); // Additional force render
+  const [currentPage, setCurrentPage] = useState<'login' | 'register' | 'complete-registration' | 'reset-password'>(() => {
+    if (typeof window !== 'undefined') {
+      const pathname = window.location.pathname;
+      const searchParams = new URLSearchParams(window.location.search);
+      const hash = window.location.hash;
+      // Reset-password has priority over query param
+      if (pathname === '/reset-password' || 
+          searchParams.get('type') === 'recovery' ||
+          hash.includes('type=recovery') ||
+          searchParams.get('access_token') ||
+          searchParams.get('refresh_token')) {
+        return 'reset-password';
+      }
+      const fromQuery = (getQueryParam('page') as any) || 'login';
+      const valid = ['login','register','complete-registration','reset-password'];
+      return valid.includes(fromQuery) ? fromQuery : 'login';
+    }
+    return 'login';
+  });
+
+  // Keep URL ?page= in sync with currentPage
+  useEffect(() => {
+    setQueryParam('page', currentPage, true);
+  }, [currentPage]);
+  
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const [assignedInvestmentAdvisor, setAssignedInvestmentAdvisor] = useState<AuthUser | null>(null);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isProcessingAuthChange, setIsProcessingAuthChange] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [hasInitialDataLoaded, setHasInitialDataLoaded] = useState(false);
+  const [ignoreAuthEvents, setIgnoreAuthEvents] = useState(false);
+
+  // Payment page removed - useEffect removed for optimization
+
+  // CRITICAL FIX: Refresh user data if startup_name is missing for Startup users
+  useEffect(() => {
+    if (isAuthenticated && currentUser && currentUser.role === 'Startup' && !currentUser.startup_name) {
+      console.log('🔍 Startup user missing startup_name, attempting to refresh user data...');
+      const refreshStartupData = async () => {
+        try {
+          const refreshedUser = await authService.getCurrentUser();
+          if (refreshedUser && refreshedUser.startup_name) {
+            console.log('✅ Startup data refreshed:', refreshedUser.startup_name);
+            setCurrentUser(refreshedUser);
+          } else {
+            console.log('❌ Still no startup_name after refresh, checking startups table...');
+            // Fallback: try to get startup name from startups table
+            const { data: startupData, error: startupError } = await authService.supabase
+              .from('startups')
+              .select('name')
+              .eq('user_id', currentUser.id)
+              .maybeSingle();
+            
+            if (startupData && !startupError) {
+              console.log('✅ Found startup name from startups table:', startupData.name);
+              setCurrentUser({ ...currentUser, startup_name: startupData.name });
+            }
+          }
+        } catch (error) {
+          console.error('❌ Error refreshing startup data:', error);
+        }
+      };
+      
+      // Add a small delay to avoid race conditions
+      const timeoutId = setTimeout(refreshStartupData, 1000);
+      return () => clearTimeout(timeoutId);
+    }
+  }, [isAuthenticated, currentUser]);
+
+  // Listen for URL changes to handle reset password links
+  useEffect(() => {
+    const handleUrlChange = () => {
+      const pathname = window.location.pathname;
+      const searchParams = new URLSearchParams(window.location.search);
+      const hash = window.location.hash;
+      
+      // Check for reset password indicators
+      if (pathname === '/reset-password' || 
+          searchParams.get('type') === 'recovery' ||
+          hash.includes('type=recovery') ||
+          searchParams.get('access_token') ||
+          searchParams.get('refresh_token')) {
+        setCurrentPage('reset-password');
+      }
+    };
+
+    // Check on mount
+    handleUrlChange();
+
+    // Listen for popstate events (back/forward navigation)
+    window.addEventListener('popstate', handleUrlChange);
+    
+    return () => {
+      window.removeEventListener('popstate', handleUrlChange);
+    };
+  }, []);
+
+  
+  
+
+
+
+
+
+
+  const [selectedStartup, setSelectedStartup] = useState<Startup | null>(null);
+  const [isViewOnly, setIsViewOnly] = useState(false);
+  const selectedStartupRef = useRef<Startup | null>(null);
+  const currentUserRef = useRef<AuthUser | null>(null);
+  
+  // Monitor view changes
+  useEffect(() => {
+    // View change monitoring
+  }, [view, selectedStartup, isViewOnly]);
+
+  // Global tab change tracker - listen for any tab changes in the app
+  useEffect(() => {
+    const handleTabChange = (event: CustomEvent) => {
+    };
+
+    // Listen for custom tab change events
+    window.addEventListener('tab-change', handleTabChange as EventListener);
+    
+    return () => {
+      window.removeEventListener('tab-change', handleTabChange as EventListener);
+    };
+  }, []);
+
+  // Keep refs in sync with state
+  useEffect(() => {
+    selectedStartupRef.current = selectedStartup;
+  }, [selectedStartup]);
+
+  useEffect(() => {
+    currentUserRef.current = currentUser;
+  }, [currentUser]);
+  const [startups, setStartups] = useState<Startup[]>([]);
+  const [newInvestments, setNewInvestments] = useState<NewInvestment[]>([]);
+  const [startupAdditionRequests, setStartupAdditionRequests] = useState<StartupAdditionRequest[]>([]);
+  
+  // Admin-related state
+  const [users, setUsers] = useState<User[]>([]);
+  const [verificationRequests, setVerificationRequests] = useState<VerificationRequest[]>([]);
+  const [investmentOffers, setInvestmentOffers] = useState<InvestmentOffer[]>([]);
+  const [validationRequests, setValidationRequests] = useState<ValidationRequest[]>([]);
+  const [pendingRelationships, setPendingRelationships] = useState<any[]>([]);
+
+  const [pendingStartupRequest, setPendingStartupRequest] = useState<StartupAdditionRequest | null>(null);
+
+  // Refs for state variables to avoid dependency issues
+  const startupsRef = useRef<Startup[]>([]);
+  const investmentOffersRef = useRef<InvestmentOffer[]>([]);
+  const validationRequestsRef = useRef<ValidationRequest[]>([]);
+  const startupRecoveryAttemptedRef = useRef<boolean>(false);
+  const startupRecoveryAttemptsRef = useRef<number>(0);
+  const startupRecoveryLastAtRef = useRef<number>(0);
+
+
+  // Keep refs in sync with state
+  useEffect(() => {
+    startupsRef.current = startups;
+  }, [startups]);
+
+  useEffect(() => {
+    investmentOffersRef.current = investmentOffers;
+  }, [investmentOffers]);
+
+  useEffect(() => {
+    validationRequestsRef.current = validationRequests;
+  }, [validationRequests]);
+
+
+  const [loadingProgress, setLoadingProgress] = useState<string>('Initializing...');
+
+  // Additional refs for fetchData dependencies
+  const isAuthenticatedRef = useRef<boolean>(false);
+  const hasInitialDataLoadedRef = useRef<boolean>(false);
+  const autoReloadGuardRef = useRef<boolean>(false);
+
+  // Keep refs in sync with state
+  useEffect(() => {
+    isAuthenticatedRef.current = isAuthenticated;
+  }, [isAuthenticated]);
+
+  useEffect(() => {
+    hasInitialDataLoadedRef.current = hasInitialDataLoaded;
+  }, [hasInitialDataLoaded]);
+
+  // Mobile Chrome safety: if we stay in loading too long, perform a one-time hard refresh
+  useEffect(() => {
+    if (autoReloadGuardRef.current) return;
+    const isMobileChrome = (() => {
+      try {
+        const ua = navigator.userAgent || '';
+        return /Chrome\/\d+/.test(ua) && /Mobile/.test(ua);
+      } catch { return false; }
+    })();
+    if (!isMobileChrome) return;
+    let t: any = null;
+    const arm = () => {
+      if (t) clearTimeout(t);
+      if (isLoading) {
+        t = setTimeout(() => {
+          if (isLoading && !hasInitialDataLoadedRef.current && !autoReloadGuardRef.current) {
+            autoReloadGuardRef.current = true;
+            try { window.location.reload(); } catch {}
+          }
+        }, 20000); // 20s hard-refresh safeguard
+      }
+    };
+    arm();
+    return () => { if (t) clearTimeout(t); };
+  }, [isLoading]);
+
+  // Disable any accidental full page reloads in development to prevent refresh loops
+  useEffect(() => {
+    try {
+      if (import.meta && (import.meta as any).env && (import.meta as any).env.DEV) {
+        const originalReload = window.location.reload;
+        (window as any).__originalReload = originalReload;
+        // No-op reload in dev
+        (window.location as any).reload = () => {
+          console.log('⚠️ Reload blocked in DEV to avoid loops');
+        };
+      }
+    } catch {}
+  }, []);
+
+
+
+  // Utility function to emit tab change events (can be used by dashboard components)
+  const emitTabChange = (tabName: string, component: string) => {
+    const event = new CustomEvent('tab-change', {
+      detail: { tabName, component }
+    });
+    window.dispatchEvent(event);
+  };
+
+  // Make emitTabChange available globally for dashboard components
+  (window as any).emitTabChange = emitTabChange;
+  
+  // Add global function to force data refresh
+  (window as any).forceDataRefresh = () => {
+    console.log('🔄 Global force data refresh triggered');
+    setHasInitialDataLoaded(false);
+    hasInitialDataLoadedRef.current = false;
+    // Reinitialize auth to reload data
+    // NOTE: We now attach the auth listener first (below) and then call
+    // initializeAuth() later to avoid a race on mobile browsers where the
+    // INITIAL_SESSION event can fire before the listener is attached.
+  };
+  
+  // Add global function to reset auth state (for debugging)
+  (window as any).resetAuthState = () => {
+    console.log('🔄 Global auth state reset triggered');
+    setCurrentUser(null);
+    setIsAuthenticated(false);
+    setHasInitialDataLoaded(false);
+    currentUserRef.current = null;
+    isAuthenticatedRef.current = false;
+    hasInitialDataLoadedRef.current = false;
+    // Clear cookies
+    setCookie('lastAuthUserId', '');
+    setCookie('lastAuthTimestamp', '');
+    // Reinitialize auth
+    initializeAuth();
+  };
+
+  // Save view to cookie whenever it changes
+  useEffect(() => {
+    setCookie('currentView', view, 1); // 1 day expiry
+  }, [view]);
+
+
+  useEffect(() => {
+    let isMounted = true;
+    
+    // Track focus/visibility timing to avoid instant re-inits on quick tab switches
+    const lastHiddenAtRef = { current: 0 } as { current: number };
+    const REFRESH_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+    
+    const initializeAuth = async () => {
+      try {
+        console.log('Starting auth initialization...');
+        
+        // Remove timeout to prevent hanging
+        // const authTimeout = new Promise((_, reject) => {
+        //   setTimeout(() => reject(new Error('Auth initialization timeout')), 10000);
+        // });
+        
+        const authPromise = (async () => {
+          // Handle access token from email confirmation first
+          const hash = window.location.hash;
+          const searchParams = new URLSearchParams(window.location.search);
+          
+          // Check for access token in hash or query parameters
+          let accessToken = null;
+          if (hash.includes('access_token=')) {
+            accessToken = hash.split('access_token=')[1]?.split('&')[0];
+          } else if (searchParams.has('access_token')) {
+            accessToken = searchParams.get('access_token');
+          }
+          
+          if (accessToken) {
+            console.log('Found access token in URL');
+            try {
+              console.log('Setting session with access token...');
+              const { data, error } = await authService.supabase.auth.setSession({
+                access_token: accessToken,
+                refresh_token: ''
+              });
+              
+              if (error) {
+                console.error('Error setting session:', error);
+              } else if (data.user) {
+                console.log('Session set successfully, handling email confirmation...');
+                const { user, error: profileError } = await authService.handleEmailConfirmation();
+                if (user && isMounted) {
+                  console.log('Email confirmation successful, user:', user.email);
+                  setCurrentUser(user);
+                  setIsAuthenticated(true);
+                  
+                } else if (profileError) {
+                  console.error('Email confirmation failed:', profileError);
+                  // If profile creation failed, try to create it manually
+                  console.log('Attempting to create profile manually...');
+                  const { user: createdUser, error: createError } = await authService.createProfile(
+                    data.user.user_metadata?.name || 'Unknown',
+                    data.user.user_metadata?.role || 'Investor'
+                  );
+                  if (createdUser && isMounted) {
+                    console.log('Profile created manually:', createdUser.email);
+                    setCurrentUser(createdUser);
+                    setIsAuthenticated(true);
+                    
+                  } else {
+                    console.error('Manual profile creation failed:', createError);
+                  }
+                }
+              }
+              
+              // Clean up the URL
+              window.history.replaceState({}, document.title, window.location.pathname);
+            } catch (error) {
+              console.error('Error during email confirmation:', error);
+            }
+          }
+
+          // Don't call getCurrentUser here - let the auth state listener handle it
+          console.log('Auth initialization complete, waiting for auth state...');
+        })();
+        
+        await authPromise;
+        
+      } catch (error) {
+        console.error('Error in auth initialization:', error);
+      } finally {
+        // Don't set loading to false here - let the auth state change handle it
+        if (isMounted) {
+          console.log('Auth initialization complete');
+        }
+      }
+    };
+
+    initializeAuth();
+
+    // Visibility/focus handlers: only refresh if away >= threshold
+    const maybeRefreshAfterAway = () => {
+      const now = Date.now();
+      const awayMs = lastHiddenAtRef.current ? now - lastHiddenAtRef.current : 0;
+      if (awayMs >= REFRESH_THRESHOLD_MS) {
+        if ((window as any).__isRefreshingData) return;
+        (window as any).__isRefreshingData = true;
+        console.log(`🔄 Returning after ${Math.round(awayMs/1000)}s away, refreshing data`);
+        // Background refresh only; keep current UI intact
+        fetchData(true)
+          .catch(() => {})
+          .finally(() => { (window as any).__isRefreshingData = false; });
+      }
+      lastHiddenAtRef.current = 0;
+    };
+
+    const onHidden = () => { lastHiddenAtRef.current = Date.now(); };
+    const onVisible = () => maybeRefreshAfterAway();
+    const onFocus = () => maybeRefreshAfterAway();
+    const onBlur = () => { lastHiddenAtRef.current = Date.now(); };
+
+    const visibilityHandler = () => {
+      if (document.hidden) onHidden(); else onVisible();
+    };
+
+    // Debounce focus to avoid rapid toggles
+    let __focusDebounce: any = null;
+    const debouncedFocus = () => {
+      if (__focusDebounce) clearTimeout(__focusDebounce);
+      __focusDebounce = setTimeout(() => { onFocus(); }, 300);
+    };
+
+    document.addEventListener('visibilitychange', visibilityHandler);
+    window.addEventListener('focus', debouncedFocus);
+    window.addEventListener('blur', onBlur);
+
+    // Mobile-safe: proactively check for an existing session and set a
+    // conservative fallback to avoid premature redirects on slower devices.
+    let __initialLoadTimeout: any = null;
+    (async () => {
+      try {
+        const { data } = await authService.supabase.auth.getSession();
+        if (!data?.session) {
+          // Recheck once after a brief delay before scheduling final fallback
+          setTimeout(async () => {
+            try {
+              const again = await authService.supabase.auth.getSession();
+              if (again.data?.session) return; // session appeared; let listener handle it
+              __initialLoadTimeout = setTimeout(() => {
+                if (isMounted && !isAuthenticatedRef.current && !currentUserRef.current) {
+                  setIsLoading(false);
+                  if (currentPage !== 'login' && currentPage !== 'register') {
+                    setCurrentPage('login');
+                  }
+                }
+              }, 20000); // 20s final fallback for mobile
+            } catch {}
+          }, 2000); // 2s recheck window
+        }
+      } catch {}
+    })();
+
+    // Track if we received any auth event on first load
+    let __initialAuthEventReceived = false;
+
+    // Set up auth state listener
+    const { data: { subscription } } = authService.onAuthStateChange(async (event, session) => {
+      __initialAuthEventReceived = true;
+      // SIMPLE FIX: If we're ignoring auth events, skip everything
+      if (ignoreAuthEvents) {
+        console.log('🚫 Ignoring auth event because ignoreAuthEvents flag is set');
+        return;
+      }
+      
+      const microSteps = [
+        `1. Auth event received: ${event}`,
+        `2. Session user: ${session?.user?.email || 'none'}`,
+        `3. Is authenticated: ${isAuthenticated}`,
+        `4. Current user: ${currentUser?.email || 'none'}`,
+        `5. Has initial data loaded: ${hasInitialDataLoaded}`,
+        `6. Current view: ${view}`,
+        `7. Is processing auth change: ${isProcessingAuthChange}`,
+        `8. Ignore auth events: ${ignoreAuthEvents}`
+      ];
+      
+      
+      if (!isMounted) return;
+      
+      // Prevent unnecessary refreshes for TOKEN_REFRESHED events
+      if (event === 'TOKEN_REFRESHED') {
+        return;
+      }
+
+      // Note: Duplicate auth event filtering is now handled at the Supabase level in auth.ts
+      
+        // Prevent multiple simultaneous auth state changes
+        if (event === 'SIGNED_IN' || event === 'INITIAL_SESSION') {
+          // Check if we're already processing an auth state change
+          if (isProcessingAuthChange) {
+            console.log('Auth state change already in progress, skipping...');
+            return;
+          }
+          
+          // Additional check: if we already have the same user authenticated, skip
+          if (isAuthenticatedRef.current && currentUserRef.current && session?.user && currentUserRef.current.id === session.user.id) {
+            console.log('🚫 User already authenticated with same ID, skipping duplicate auth event');
+            return;
+          }
+        
+        // IMPROVED FIX: Only block duplicate auth events, not all auth events
+        if (isAuthenticatedRef.current && currentUserRef.current && hasInitialDataLoadedRef.current && session?.user && currentUserRef.current.id === session.user.id) {
+          // Only block token refresh duplicates; never block INITIAL_SESSION across tabs
+          if (event === 'TOKEN_REFRESHED') {
+            console.log('🚫 IMPROVED FIX: Blocking duplicate auth event to prevent unnecessary refresh');
+            return;
+          }
+          // Allow other auth events to proceed (like profile updates, data changes)
+          console.log('✅ Allowing auth event to proceed:', event);
+        }
+        
+        // Check if this is a duplicate auth event using cookies
+        const lastAuthUserId = getCookie('lastAuthUserId');
+        const lastAuthTimestamp = getCookie('lastAuthTimestamp');
+        const currentTime = Date.now().toString();
+        
+        console.log('🔍 Auth event debug:', {
+          event,
+          sessionUserId: session?.user?.id,
+          lastAuthUserId,
+          lastAuthTimestamp,
+          currentTime,
+          isAuthenticated: isAuthenticatedRef.current,
+          currentUserId: currentUserRef.current?.id
+        });
+        
+        if (session?.user && lastAuthUserId === session.user.id && lastAuthTimestamp) {
+          const timeDiff = parseInt(currentTime) - parseInt(lastAuthTimestamp);
+          console.log('🔍 Time difference:', timeDiff, 'ms');
+          // If less than 5 seconds have passed, it's likely a duplicate event from window focus
+          // BUT do not skip during initial boot while the UI is still loading.
+          if (timeDiff < 5000) {
+            if (isLoading) {
+              console.log('ℹ️ Duplicate auth event during initial boot – proceeding to finish initialization');
+            } else {
+              console.log('🚫 Duplicate auth event detected (likely from window focus), skipping to prevent refresh');
+              return;
+            }
+          }
+        }
+        
+        // Store current auth info in cookies
+        if (session?.user) {
+          setCookie('lastAuthUserId', session.user.id, 1); // 1 day expiry
+          setCookie('lastAuthTimestamp', currentTime, 1);
+          console.log('💾 Stored auth info in cookies:', { userId: session.user.id, timestamp: currentTime });
+        }
+        
+        setIsProcessingAuthChange(true);
+        
+        try {
+          if (session?.user) {
+            // Check if email is confirmed before allowing login
+            if (!session.user.email_confirmed_at) {
+              console.log('Email not confirmed, signing out user');
+              await authService.supabase.auth.signOut();
+              setError('Please confirm your email before logging in. Check your inbox for the confirmation link.');
+              return;
+            }
+            
+            // Optimistic: set minimal user immediately so data hooks can proceed
+            if (isMounted) {
+              const minimalUser: any = {
+                id: session.user.id,
+                email: session.user.email || '',
+                name: (session.user.user_metadata as any)?.name || 'Unknown',
+                role: (session.user.user_metadata as any)?.role || 'Investor',
+                registration_date: new Date().toISOString().split('T')[0]
+              };
+              setCurrentUser(minimalUser);
+              setIsAuthenticated(true);
+              // Critical: reset data-loaded flag on any fresh auth so initial fetch runs after refresh
+              setHasInitialDataLoaded(false);
+              // Prefetch data immediately on auth - don't wait for useEffect
+              // This starts loading data as soon as we know the user is authenticated
+              (async () => {
+                try {
+                  await fetchData(true);
+                } catch (error) {
+                  // Silently fail - useEffect will retry
+                }
+              })();
+              // Proactively fetch the user's startup by user_id to avoid blank state on mobile refresh
+              (async () => {
+                try {
+                  if ((minimalUser as any).role === 'Startup') {
+                    console.log('🔍 Proactive fetch: loading startup by user_id after auth event...');
+                    const { data: startupsByUser, error: startupsByUserError } = await authService.supabase
+                      .from('startups')
+                      .select('*')
+                      .eq('user_id', session.user.id);
+                    if (!startupsByUserError && startupsByUser && startupsByUser.length > 0) {
+                      setStartups(startupsByUser as any);
+                      setSelectedStartup(startupsByUser[0] as any);
+                      setView('startupHealth');
+                      setIsLoading(false);
+                      // Persist startup_name to user profile to make next refresh instant
+                      try {
+                        await authService.supabase
+                          .from('users')
+                          .update({ startup_name: (startupsByUser[0] as any).name })
+                          .eq('id', session.user.id);
+                      } catch {}
+                    }
+                  }
+                } catch (e) {
+                  console.warn('⚠️ Proactive startup fetch failed (non-blocking):', e);
+                }
+              })();
+            }
+
+            // Get complete user data from database
+            if (isMounted) {
+              console.log('🔄 Fetching complete user data from database...');
+              try {
+                const completeUser = await authService.getCurrentUser();
+                if (completeUser) {
+                  console.log('✅ Complete user data loaded:', completeUser);
+                  console.log('🔍 User startup_name from complete data:', completeUser.startup_name);
+                  
+                  // CRITICAL FIX: If startup_name is missing, try to fetch it from startups table
+                  if (!completeUser.startup_name && completeUser.role === 'Startup') {
+                    console.log('🔍 Startup user missing startup_name, attempting to fetch from startups table...');
+                    try {
+                      const { data: startupData, error: startupError } = await authService.supabase
+                        .from('startups')
+                        .select('name')
+                        .eq('user_id', completeUser.id)
+                        .maybeSingle();
+                      
+                      if (startupData && !startupError) {
+                        console.log('✅ Found startup name from startups table:', startupData.name);
+                        completeUser.startup_name = startupData.name;
+                      } else {
+                        console.log('❌ No startup found in startups table for user:', completeUser.id);
+                      }
+                    } catch (startupFetchError) {
+                      console.error('❌ Error fetching startup name:', startupFetchError);
+                    }
+                  }
+                  
+                  // ADDITIONAL FIX: If user has startup_name but no startup record, create one
+                  if (completeUser.startup_name && completeUser.role === 'Startup') {
+                    console.log('🔍 User has startup_name, checking if startup record exists...');
+                    try {
+                      const { data: existingStartup, error: startupCheckError } = await authService.supabase
+                        .from('startups')
+                        .select('id, name')
+                        .eq('user_id', completeUser.id)
+                        .maybeSingle();
+                      
+                      if (!existingStartup && !startupCheckError) {
+                        console.log('🔍 No startup record found, creating one for user:', completeUser.startup_name);
+                        const { data: newStartup, error: createStartupError } = await authService.supabase
+                          .from('startups')
+                          .insert({
+                            name: completeUser.startup_name || 'Unnamed Startup',
+                            user_id: completeUser.id,
+                            sector: 'Unknown', // Default sector - will be updated when domain is selected
+                            current_valuation: 0,
+                            total_funding: 0,
+                            total_revenue: 0,
+                            compliance_status: 'pending',
+                            registration_date: new Date().toISOString().split('T')[0],
+                            investment_type: 'Seed',
+                            investment_value: 0,
+                            equity_allocation: 0
+                          } as any)
+                          .select()
+                          .single();
+                        
+                        if (newStartup && !createStartupError) {
+                          console.log('✅ Created startup record:', newStartup);
+                        } else {
+                          console.error('❌ Error creating startup record:', createStartupError);
+                          console.error('❌ Startup creation failed. Details:', {
+                            error: createStartupError,
+                            user_id: completeUser.id,
+                            startup_name: completeUser.startup_name,
+                            user_role: completeUser.role
+                          });
+                        }
+                      } else if (existingStartup) {
+                        console.log('✅ Startup record already exists:', existingStartup.name);
+                      }
+                    } catch (startupRecordError) {
+                      console.error('❌ Error checking/creating startup record:', startupRecordError);
+                    }
+                  }
+                  
+                  setCurrentUser(completeUser);
+                  setIsAuthenticated(true);
+                  setIsLoading(false);
+                } else {
+                  console.log('❌ Could not load complete user data, creating basic profile...');
+                  
+                  // Create a basic profile for users who don't have one
+                  try {
+                    const { data: newProfile, error: createError } = await authService.supabase
+                      .from('users')
+                      .insert({
+                        id: session.user.id,
+                        email: session.user.email,
+                        name: session.user.user_metadata?.name || 'Unknown',
+                        role: session.user.user_metadata?.role || 'Investor',
+                        startup_name: session.user.user_metadata?.startupName || null,
+                        registration_date: new Date().toISOString().split('T')[0],
+                        created_at: new Date().toISOString(),
+                        updated_at: new Date().toISOString()
+                      })
+                      .select()
+                      .single();
+                    
+                    if (newProfile && !createError) {
+                      console.log('✅ Created new user profile:', newProfile);
+                      setCurrentUser(newProfile);
+                      setIsAuthenticated(true);
+                      setIsLoading(false);
+                      
+                      // For new users, redirect to Form 2 to complete their profile
+                      if (newProfile.role === 'Startup') {
+                        console.log('🔄 New startup user created, redirecting to Form 2');
+                        setCurrentPage('complete-registration');
+                        return;
+                      }
+                    } else {
+                      console.error('❌ Error creating user profile:', createError);
+                      throw createError;
+                    }
+                  } catch (profileCreateError) {
+                    console.error('❌ Failed to create user profile, using basic user:', profileCreateError);
+                    const basicUser: AuthUser = {
+                      id: session.user.id,
+                      email: session.user.email || '',
+                      name: session.user.user_metadata?.name || 'Unknown',
+                      role: session.user.user_metadata?.role || 'Investor',
+                      startup_name: session.user.user_metadata?.startupName || undefined,
+                      registration_date: new Date().toISOString().split('T')[0]
+                    };
+                    setCurrentUser(basicUser);
+                    setIsAuthenticated(true);
+                    setIsLoading(false);
+                  }
+                }
+              } catch (error) {
+                console.error('❌ Error loading complete user data:', error);
+                const basicUser: AuthUser = {
+                  id: session.user.id,
+                  email: session.user.email || '',
+                  name: session.user.user_metadata?.name || 'Unknown',
+                  role: session.user.user_metadata?.role || 'Investor',
+                  startup_name: session.user.user_metadata?.startupName || undefined,
+                  registration_date: new Date().toISOString().split('T')[0]
+                };
+                setCurrentUser(basicUser);
+                setIsAuthenticated(true);
+                setIsLoading(false);
+              }
+              
+              
+              // Only reset data loading flag if this is a truly new user
+              if (!hasInitialDataLoaded) {
+                setHasInitialDataLoaded(false);
+              }
+            }
+
+            // Try to get full profile, and if it doesn't exist, create it automatically
+            (async () => {
+              try {
+                console.log('Fetching full profile after sign-in...');
+                let profileUser = await authService.getCurrentUser();
+                
+                if (!profileUser) {
+                  console.log('Profile not found, attempting to create it automatically...');
+                  // Profile doesn't exist, try to create it from user metadata
+                  const metadata = session.user.user_metadata;
+                  if (metadata?.name && metadata?.role) {
+                    console.log('Creating profile automatically with metadata:', { name: metadata.name, role: metadata.role });
+                    
+                    // Create the profile
+                    const { data: newProfile, error: createError } = await authService.supabase
+                      .from('users')
+                      .insert({
+                        id: session.user.id,
+                        email: session.user.email,
+                        name: metadata.name,
+                        role: metadata.role,
+                        startup_name: metadata.startupName || null,
+                        registration_date: new Date().toISOString().split('T')[0]
+                      })
+                      .select()
+                      .single();
+
+                    if (createError) {
+                      console.error('Error creating profile automatically:', createError);
+                    } else {
+                      console.log('Profile created automatically:', newProfile);
+                      
+                      // If role is Startup and startup_name was provided, create startup record
+                      if (metadata.role === 'Startup' && metadata.startupName) {
+                        try {
+                          const { data: existingStartup } = await authService.supabase
+                            .from('startups')
+                            .select('id')
+                            .eq('name', metadata.startupName)
+                            .single();
+
+                          if (!existingStartup) {
+                            // Calculate current valuation from default price per share and total shares
+                            const defaultPricePerShare = 0.01;
+                            const defaultTotalShares = 1000000;
+                            const calculatedCurrentValuation = defaultPricePerShare * defaultTotalShares;
+                            
+                            await authService.supabase
+                              .from('startups')
+                              .insert({
+                                name: metadata.startupName,
+                                investment_type: 'Seed',
+                                investment_value: 0,
+                                equity_allocation: 0,
+                                current_valuation: calculatedCurrentValuation,
+                                compliance_status: 'Pending',
+                                sector: 'Unknown',
+                                total_funding: 0,
+                                total_revenue: 0,
+                                registration_date: new Date().toISOString().split('T')[0],
+                                user_id: session.user.id
+                              });
+                            console.log('Startup record created automatically');
+                          }
+                        } catch (e) {
+                          console.warn('Failed to create startup record automatically (non-blocking):', e);
+                        }
+                      }
+                      
+                      // Now try to get the profile again
+                      profileUser = await authService.getCurrentUser();
+                    }
+                  }
+                }
+                
+                if (profileUser && isMounted) {
+                  console.log('Full profile loaded. Updating currentUser with startup_name:', profileUser.startup_name);
+                  
+                  // Check if profile is complete using the proper method
+                  const isProfileComplete = await authService.isProfileComplete(profileUser.id);
+                  console.log('Profile completion status:', isProfileComplete);
+                  
+                  // Check if profile is complete before setting as authenticated
+                  if (!isProfileComplete) {
+                    console.log('Profile not complete, redirecting to complete-registration page');
+                    setCurrentUser(profileUser);
+                    setCurrentPage('complete-registration');
+                    setIsLoading(false);
+                    setIsProcessingAuthChange(false);
+                    return;
+                  }
+                  
+                  setCurrentUser(profileUser);
+                }
+              } catch (e) {
+                console.error('Failed to load/create full user profile after sign-in (non-blocking):', e);
+              } finally {
+                // Reset the flag when done
+                if (isMounted) {
+                  setIsProcessingAuthChange(false);
+                }
+              }
+            })();
+          } else {
+            // No existing session; show login page
+            if (isMounted) {
+              setCurrentUser(null);
+              setIsAuthenticated(false);
+              setIsLoading(false);
+              setIsProcessingAuthChange(false);
+            }
+          }
+        } catch (error) {
+          console.error('Error processing auth state change:', error);
+          if (isMounted) {
+            setIsProcessingAuthChange(false);
+          }
+        }
+      } else if (event === 'SIGNED_OUT') {
+        if (isMounted) {
+          setCurrentUser(null);
+          setAssignedInvestmentAdvisor(null);
+          setIsAuthenticated(false);
+          setIsLoading(false);
+          setIsProcessingAuthChange(false);
+          setHasInitialDataLoaded(false); // Reset data loading flag on logout
+        }
+      }
+    });
+
+      // Remove the loading timeout - it's causing issues
+  // const timeoutId = setTimeout(() => {
+  //   if (isMounted && isLoading) {
+  //     console.log('Loading timeout reached, setting loading to false');
+  //     setIsLoading(false);
+  //   }
+  // }, 10000); // 10 seconds timeout
+
+    // After listener is attached, kick off initialization (prevents mobile race)
+    initializeAuth();
+
+    // Fallback: if no auth event arrives shortly but a session exists, bootstrap manually
+    setTimeout(async () => {
+      try {
+        if (!__initialAuthEventReceived && !isAuthenticatedRef.current) {
+          const { data } = await authService.supabase.auth.getSession();
+          if (data?.session) {
+            try {
+              const completeUser = await authService.getCurrentUser();
+              if (completeUser) {
+                setCurrentUser(completeUser);
+                setIsAuthenticated(true);
+                setIsLoading(false);
+                if (!hasInitialDataLoadedRef.current) {
+                  fetchData().catch(() => {});
+                }
+              }
+            } catch (e) {
+              // ignore; normal flow will handle later
+            }
+          }
+        }
+      } catch {}
+    }, 2000);
+
+    return () => {
+      isMounted = false;
+      subscription?.unsubscribe();
+      document.removeEventListener('visibilitychange', visibilityHandler);
+      window.removeEventListener('focus', debouncedFocus);
+      window.removeEventListener('blur', onBlur);
+      if (__initialLoadTimeout) clearTimeout(__initialLoadTimeout);
+    };
+  }, []);
+
+
+  // Fetch assigned investment advisor data
+  const fetchAssignedInvestmentAdvisor = useCallback(async (advisorCode: string) => {
+    try {
+      console.log('🔍 Fetching investment advisor data for code:', advisorCode);
+      const { data: advisor, error } = await supabase
+        .from('users')
+        .select('id, email, name, role, investment_advisor_code, logo_url')
+        .eq('investment_advisor_code', advisorCode)
+        .eq('role', 'Investment Advisor')
+        .single();
+      
+      if (error) {
+        console.error('❌ Error fetching investment advisor:', error);
+        return null;
+      }
+      
+      if (advisor) {
+        console.log('✅ Found assigned investment advisor:', advisor);
+        console.log('🔍 Advisor logo_url:', advisor.logo_url);
+        console.log('🔍 Advisor has logo:', !!advisor.logo_url);
+        setAssignedInvestmentAdvisor(advisor);
+        return advisor;
+      }
+      
+      return null;
+    } catch (error) {
+      console.error('❌ Error in fetchAssignedInvestmentAdvisor:', error);
+      return null;
+    }
+  }, []);
+
+  // Fetch data function - optimized with role-based fetching, caching, and retry logic
+  const fetchData = useCallback(async (forceRefresh = false) => {
+    if (!isAuthenticatedRef.current || !currentUserRef.current) {
+      return;
+    }
+    
+    // Don't fetch data if we already have it and this isn't a forced refresh
+    if (hasInitialDataLoadedRef.current && !forceRefresh) {
+      return;
+    }
+
+    const user = currentUserRef.current;
+    const userId = user.id;
+    const role = user.role as any;
+    
+    // Generate role-specific cache key
+    const cacheKey = requestCache.generateRoleKey(
+      role,
+      userId,
+      'fetchData',
+      forceRefresh ? 'force' : 'cached'
+    );
+    
+    // Use cache for non-forced refreshes
+    if (!forceRefresh) {
+      return requestCache.get(cacheKey, async () => {
+        return fetchDataInternal(true);
+      }, 30000); // 30 second cache
+    }
+    
+    return fetchDataInternal(forceRefresh);
+    
+    async function fetchDataInternal(forceRefresh: boolean) {
+      let didSucceed = false;
+      // Phase 0: for Startup role, load startup FIRST and show dashboard immediately
+      const cu = currentUserRef.current;
+      if (cu?.role === 'Startup' && !selectedStartupRef.current) {
+        try {
+        const { data: row, error: rowErr } = await withRetry(
+          () => authService.supabase
+            .from('startups')
+            .select('id, name, user_id, sector, current_valuation, total_funding, total_revenue, compliance_status, registration_date, investment_type, investment_value, equity_allocation')
+            .eq('user_id', cu.id)
+            .maybeSingle()
+            .then(({ data, error }) => {
+              if (error) throw error;
+              return { data, error };
+            })
+        );
+        if (row && !rowErr) {
+          setStartups([row] as any);
+          setSelectedStartup(row as any);
+          setIsLoading(false);
+          setView('startupHealth');
+          // Load other data in background without blocking
+          (async () => {
+            try {
+              const bgOffers = await withRetry(() => investmentService.getOffersForStartup(row.id));
+              setInvestmentOffers(bgOffers);
+            } catch {}
+          })();
+          // Mark as loaded so main batch doesn't run for Startup users
+          setHasInitialDataLoaded(true);
+          return;
+        }
+        } catch (err) {
+          console.error('Error loading startup data:', err);
+        }
+      }
+      try {
+        // Use role-based data fetching - only fetch what's needed
+        const user = currentUserRef.current;
+        const roleData = await fetchRoleBasedData({
+          role: user.role as any,
+          userId: user.id,
+          email: user.email,
+          investorCode: (user as any)?.investor_code || (user as any)?.investorCode,
+          selectedStartupId: selectedStartupRef.current?.id,
+          forceRefresh,
+        });
+
+        // Map role-based data to our state structure
+        const startupsData = { status: 'fulfilled' as const, value: roleData.startups || [] };
+        const investmentsData = { status: 'fulfilled' as const, value: roleData.investments || [] };
+        const requestsData = { status: 'fulfilled' as const, value: roleData.requests || [] };
+        const usersData = { status: 'fulfilled' as const, value: roleData.users || [] };
+        const verificationData = { status: 'fulfilled' as const, value: roleData.verifications || [] };
+        const offersData = { status: 'fulfilled' as const, value: roleData.offers || [] };
+        const validationData = { status: 'fulfilled' as const, value: roleData.validations || [] };
+
+        // Set data with fallbacks
+        let baseStartups = startupsData.value || [];
+        const requests = requestsData.value || [];
+
+        // If investor, augment portfolio with approved requests (memoized)
+        const actualCurrentUser = currentUserRef.current || currentUser;
+        if (actualCurrentUser?.role === 'Investor' && Array.isArray(requests)) {
+          const investorCode = (actualCurrentUser as any)?.investor_code || (actualCurrentUser as any)?.investorCode;
+          
+          const approvedNames = requests
+            .filter((r: any) => {
+              const status = (r.status || 'pending');
+              const isApproved = status === 'approved';
+              const matchesCode = !investorCode || !r?.investor_code || (r.investor_code === investorCode || r.investorCode === investorCode);
+              return isApproved && matchesCode;
+            })
+            .map((r: any) => r.name)
+            .filter((n: any) => !!n);
+          
+          if (approvedNames.length > 0) {
+            const canonical = await withRetry(() => startupService.getStartupsByNames(approvedNames));
+            
+            // Merge unique by name (not id) to prevent duplicates
+            const byName: Record<string, any> = {};
+            
+            // First add existing startups
+            baseStartups.forEach((s: any) => { 
+              if (s && s.name) byName[s.name] = s; 
+            });
+            
+            // Then add approved startups (overwrite if duplicate name)
+            canonical.forEach((s: any) => { 
+              if (s && s.name) {
+                byName[s.name] = s; 
+              }
+            });
+            
+            baseStartups = Object.values(byName) as any[];
+          }
+        }
+
+        // Batch state updates for better performance
+        setStartups(baseStartups);
+        setNewInvestments(investmentsData.value || []);
+        setStartupAdditionRequests(requests);
+        setUsers(usersData.value || []);
+        setVerificationRequests(verificationData.value || []);
+        setInvestmentOffers(offersData.value || []);
+        setValidationRequests(validationData.value || []);
+
+        // Fetch pending relationships for Investment Advisors (if needed)
+        if (roleData.relationships !== undefined) {
+          setPendingRelationships(roleData.relationships || []);
+        } else {
+          setPendingRelationships([]);
+        }
+
+        didSucceed = true;
+      
+      // Fetch assigned investment advisor if user has one
+      if (currentUserRef.current?.investment_advisor_code_entered) {
+        try {
+          const advisorResult = await withRetry(
+            () => fetchAssignedInvestmentAdvisor(currentUserRef.current!.investment_advisor_code_entered!)
+          );
+          if (advisorResult) {
+            setAssignedInvestmentAdvisor(advisorResult);
+          }
+        } catch (error) {
+          console.error('Error fetching investment advisor:', error);
+          setAssignedInvestmentAdvisor(null);
+        }
+      } else {
+        setAssignedInvestmentAdvisor(null);
+      }
+      
+        // For startup users, automatically find their startup (only if not already set)
+        if (currentUserRef.current?.role === 'Startup' && baseStartups.length > 0 && !selectedStartupRef.current) {
+          // Primary: match by startup_name from user profile
+          let userStartup = baseStartups.find(startup => startup.name === currentUserRef.current.startup_name);
+
+          // Fallback: if startup_name missing or mismatch, but user has exactly one startup, use it
+          if (!userStartup && baseStartups.length === 1) {
+            userStartup = baseStartups[0];
+          }
+          
+          if (userStartup) {
+            setSelectedStartup(userStartup);
+            // Only set view to startupHealth on initial load, not on subsequent data fetches
+            if (!hasInitialDataLoadedRef.current) {
+              setView('startupHealth');
+            }
+          }
+        } else if (currentUserRef.current?.role === 'Startup' && selectedStartupRef.current) {
+          // Update selectedStartup with fresh data from the startups array
+          const updatedStartup = baseStartups.find(s => s.id === selectedStartupRef.current?.id);
+          if (updatedStartup) {
+            setSelectedStartup(updatedStartup);
+          }
+        }
+      } catch (error) {
+        const errorMessage = handleError(error, 'Data Fetch');
+        console.error('Error fetching data:', error);
+        setError(errorMessage);
+        
+        // Set empty arrays if data fetch fails
+        setStartups([]);
+        setNewInvestments([]);
+        setStartupAdditionRequests([]);
+        setUsers([]);
+        setVerificationRequests([]);
+        setInvestmentOffers([]);
+      } finally {
+        // Only set loading to false if we're still in loading state
+        setIsLoading(false);
+        // Mark that initial data has been loaded ONLY on success; leave false on error to allow retries
+        if (didSucceed) {
+          setHasInitialDataLoaded(true);
+        }
+      }
+    } // End of fetchDataInternal
+  }, [fetchAssignedInvestmentAdvisor]);
+
+  // Fetch data when authenticated - with small post-refresh delay for mobile
+  useEffect(() => {
+    if (isAuthenticated && currentUser && !hasInitialDataLoaded) {
+      const t = setTimeout(() => { fetchData(); }, 400); // 400ms debounce after refresh
+      return () => clearTimeout(t);
+    }
+  }, [isAuthenticated, currentUser?.id, hasInitialDataLoaded]);
+
+  // Optimized watchdog with visibility awareness and fast retry
+  useEffect(() => {
+    if (!isAuthenticated || !currentUser || hasInitialDataLoaded) return;
+    
+    const watchdog = createVisibilityAwareWatchdog(
+      async () => {
+        await fetchData(true);
+        return hasInitialDataLoadedRef.current;
+      },
+      () => {
+        // Success callback - data loaded
+      },
+      {
+        fastRetryDelay: 300,
+        maxRetries: 4,
+        retryDelays: [1000, 2000, 4000, 8000],
+        checkVisibility: true,
+      }
+    );
+
+    return () => watchdog.cancel();
+  }, [isAuthenticated, currentUser?.id, hasInitialDataLoaded, fetchData]);
+
+  // Listen for offer stage updates and refresh investor offers
+  useEffect(() => {
+    const handleOfferStageUpdate = async (event: CustomEvent) => {
+      const detail = event.detail;
+      console.log('🔔 Offer stage updated event received:', detail);
+      
+      // Only refresh if current user is an Investor
+      if (currentUser?.role === 'Investor' && currentUser?.email) {
+        console.log('🔄 Refreshing investor offers after stage update...');
+        try {
+          // Use getUserInvestmentOffers which is what App.tsx uses
+          const refreshedOffers = await investmentService.getUserInvestmentOffers(currentUser.email);
+          console.log('✅ Refreshed offers:', refreshedOffers.length);
+          setInvestmentOffers(refreshedOffers);
+        } catch (error) {
+          console.error('❌ Error refreshing offers after stage update:', error);
+        }
+      }
+    };
+
+    window.addEventListener('offerStageUpdated', handleOfferStageUpdate as EventListener);
+    
+    return () => {
+      window.removeEventListener('offerStageUpdated', handleOfferStageUpdate as EventListener);
+    };
+  }, [currentUser?.role, currentUser?.email]);
+
+  // Set ignore flag when user is fully authenticated and has data
+  useEffect(() => {
+    if (isAuthenticated && currentUser && hasInitialDataLoaded) {
+      console.log('✅ User fully authenticated with data loaded, setting ignoreAuthEvents flag');
+      setIgnoreAuthEvents(true);
+    } else {
+      setIgnoreAuthEvents(false);
+    }
+  }, [isAuthenticated, currentUser, hasInitialDataLoaded]);
+
+
+  // Load startup-scoped offers after startup is resolved to avoid being overwritten by global fetch
+  useEffect(() => {
+    (async () => {
+      if (currentUser?.role === 'Startup' && selectedStartup?.id) {
+        const rows = await investmentService.getOffersForStartup(selectedStartup.id);
+        setInvestmentOffers(rows);
+      }
+    })();
+  }, [selectedStartup?.id]);
+
+
+
+  const handleLogin = useCallback(async (user: AuthUser) => {
+    console.log(`User ${user.email} logged in as ${user.role}`);
+    setIsAuthenticated(true);
+    setCurrentUser(user);
+    
+    // Check for returnUrl to redirect back to program view
+    const returnUrl = getQueryParam('returnUrl');
+    if (returnUrl) {
+      console.log('🔄 Redirecting to returnUrl:', returnUrl);
+      window.location.href = returnUrl;
+      return;
+    }
+    
+    // For non-startup users, set the view after data is loaded
+    if (user.role !== 'Startup') {
+      setView('investor'); // Default view for non-startup users
+    }
+  }, []);
+
+  const handleRegister = useCallback((user: AuthUser, foundersData: Founder[], startupName?: string, investmentAdvisorCode?: string) => {
+    console.log(`User ${user.email} registered as ${user.role}`);
+    
+    if (user.role === 'Startup' && foundersData.length > 0) {
+        console.log('Registering with founders:', foundersData);
+        const newStartup: Startup = {
+            id: Date.now(),
+            name: startupName || "Newly Registered Co",
+            investmentType: InvestmentType.Seed,
+            investmentValue: 0,
+            equityAllocation: 0,
+            currentValuation: 0,
+            complianceStatus: ComplianceStatus.Pending,
+            sector: "Unknown",
+            totalFunding: 0,
+            totalRevenue: 0,
+            registrationDate: new Date().toISOString().split('T')[0],
+            founders: foundersData,
+        };
+        setStartups(prev => [newStartup, ...prev]);
+        setSelectedStartup(newStartup);
+        setView('startupHealth');
+    }
+     
+    handleLogin(user);
+  }, [handleLogin]);
+
+  const handleLogout = useCallback(async () => {
+    try {
+      await authService.signOut();
+      setIsAuthenticated(false);
+      setCurrentUser(null);
+      setAssignedInvestmentAdvisor(null);
+      setSelectedStartup(null);
+      setCurrentPage('login');
+      setView('investor');
+      setHasInitialDataLoaded(false); // Reset data loading flag on logout
+      setIgnoreAuthEvents(false); // Reset ignore flag on logout
+      
+      // Clear auth cookies on logout
+      deleteCookie('lastAuthUserId');
+      deleteCookie('lastAuthTimestamp');
+      deleteCookie('currentView');
+    } catch (error) {
+      console.error('Logout failed:', error);
+    }
+  }, []);
+
+  const handleViewStartup = useCallback((startup: Startup | number, targetTab?: string) => {
+    // logDiagnostic disabled to prevent interference
+    
+    // Handle both startup object and startup ID
+    let startupObj: Startup;
+    if (typeof startup === 'number') {
+      // Find startup by ID
+      startupObj = startupsRef.current.find(s => s.id === startup);
+      if (!startupObj) {
+        console.error('Startup not found with ID:', startup, 'in available startups:', startupsRef.current.map(s => ({ id: s.id, name: s.name })));
+        // Fetch from database as a fallback for all roles (including Investor)
+        console.log('🔍 Fallback: fetching startup from database for direct view access...');
+        handleFacilitatorStartupAccess(startup, targetTab);
+        return;
+      }
+    } else {
+      startupObj = startup;
+    }
+    
+    // For investors and investment advisors, always fetch fresh, enriched startup data from DB so all fields are populated
+    if (currentUser?.role === 'Investor' || currentUser?.role === 'Investment Advisor') {
+      console.log('🔍 Investor access: fetching enriched startup data for view');
+      handleFacilitatorStartupAccess(startupObj.id, targetTab);
+      return;
+    }
+    
+    console.log('🔍 Setting selectedStartup to:', startupObj);
+    
+    // Set view-only mode based on user role
+    const isViewOnlyMode = currentUser?.role === 'CA' || currentUser?.role === 'CS' || currentUser?.role === 'Startup Facilitation Center' || currentUser?.role === 'Investor' || currentUser?.role === 'Investment Advisor';
+    console.log('🔍 Setting isViewOnly to:', isViewOnlyMode);
+    
+    // Set the startup and view
+    setSelectedStartup(startupObj);
+    setIsViewOnly(isViewOnlyMode);
+    // logDiagnostic disabled to prevent interference
+    setView('startupHealth');
+    
+    // If facilitator is accessing, set the target tab
+    if (currentUser?.role === 'Startup Facilitation Center' && targetTab) {
+      // Store the target tab for the StartupHealthView to use
+      (window as any).facilitatorTargetTab = targetTab;
+    }
+    
+    setViewKey(prev => prev + 1); // Force re-render
+    setForceRender(prev => prev + 1); // Additional force render
+    
+    // Force additional re-renders to ensure state changes are applied
+    setTimeout(() => {
+      console.log('🔍 Forcing additional re-render...');
+      setViewKey(prev => prev + 1);
+      setForceRender(prev => prev + 1);
+    }, 50);
+    
+    setTimeout(() => {
+      console.log('🔍 Forcing final re-render...');
+      setViewKey(prev => prev + 1);
+      setForceRender(prev => prev + 1);
+    }, 100);
+    
+    console.log('🔍 handleViewStartup completed');
+  }, [currentUser?.role]);
+
+  // Separate async function to handle facilitator startup access
+  const handleFacilitatorStartupAccess = async (startupId: number, targetTab?: string) => {
+    try {
+      console.log('🔍 Fetching startup data for facilitator, ID:', startupId);
+      
+      // Fetch startup data, fundraising details, share data, founders data, subsidiaries, and international operations in parallel
+      const [startupResult, fundraisingResult, sharesResult, foundersResult, subsidiariesResult, internationalOpsResult] = await Promise.allSettled([
+        supabase
+          .from('startups')
+          .select('*')
+          .eq('id', startupId)
+          .single(),
+        supabase
+          .from('fundraising_details')
+          .select('value, equity, domain, pitch_deck_url, pitch_video_url, currency')
+          .eq('startup_id', startupId)
+          .limit(1),
+        supabase
+          .from('startup_shares')
+          .select('total_shares, esop_reserved_shares, price_per_share')
+          .eq('startup_id', startupId)
+          .single(),
+        supabase
+          .from('founders')
+          .select('name, email, shares, equity_percentage')
+          .eq('startup_id', startupId),
+        supabase
+          .from('subsidiaries')
+          .select('*')
+          .eq('startup_id', startupId),
+        // international_operations table may not exist, Promise.allSettled handles errors gracefully
+        supabase
+          .from('international_operations')
+          .select('*')
+          .eq('startup_id', startupId)
+      ]);
+      
+      const startupData = startupResult.status === 'fulfilled' ? startupResult.value : null;
+      const fundraisingData = fundraisingResult.status === 'fulfilled' ? fundraisingResult.value : null;
+      const sharesData = sharesResult.status === 'fulfilled' ? sharesResult.value : null;
+      const foundersData = foundersResult.status === 'fulfilled' ? foundersResult.value : null;
+      const subsidiariesData = subsidiariesResult.status === 'fulfilled' ? subsidiariesResult.value : null;
+      const internationalOpsData = internationalOpsResult.status === 'fulfilled' ? internationalOpsResult.value : null;
+      
+      if (startupData.error || !startupData.data) {
+        console.error('Error fetching startup from database:', startupData.error);
+        messageService.error(
+          'Access Denied',
+          'Unable to access startup. Please check your permissions.'
+        );
+        return;
+      }
+      
+      const fetchedStartup = startupData.data;
+      const shares = sharesData?.data;
+      const founders = foundersData?.data || [];
+      const subsidiaries = subsidiariesData?.data || [];
+      const internationalOps = internationalOpsData?.data || [];
+      
+      // Map founders data to include shares; if shares are missing, derive from equity percentage
+      const totalSharesForDerivation = shares?.total_shares || 0;
+      const mappedFounders = founders.map((founder: any) => {
+        const equityPct = Number(founder.equity_percentage) || 0;
+        const sharesFromEquity = totalSharesForDerivation > 0 && equityPct > 0
+          ? Math.round((equityPct / 100) * totalSharesForDerivation)
+          : 0;
+        return {
+          name: founder.name,
+          email: founder.email,
+          shares: Number(founder.shares) || sharesFromEquity,
+          equityPercentage: equityPct
+        };
+      });
+      
+      // Map subsidiaries data
+      const normalizeDate = (value: unknown): string => {
+        if (!value) return '';
+        if (value instanceof Date) return value.toISOString().split('T')[0];
+        const str = String(value);
+        return str.includes('T') ? str.split('T')[0] : str;
+      };
+      
+      const mappedSubsidiaries = subsidiaries.map((sub: any) => ({
+        id: sub.id,
+        country: sub.country,
+        companyType: sub.company_type,
+        registrationDate: normalizeDate(sub.registration_date),
+        caCode: sub.ca_service_code,
+        csCode: sub.cs_service_code,
+      }));
+      
+      // Map international operations data
+      const mappedInternationalOps = internationalOps.map((op: any) => ({
+        id: op.id,
+        country: op.country,
+        companyType: op.company_type,
+        startDate: normalizeDate(op.start_date),
+      }));
+      
+      // Build profile data object
+      const profileData = {
+        country: fetchedStartup.country_of_registration || fetchedStartup.country,
+        companyType: fetchedStartup.company_type,
+        registrationDate: normalizeDate(fetchedStartup.registration_date),
+        currency: fetchedStartup.currency || 'USD',
+        subsidiaries: mappedSubsidiaries,
+        internationalOps: mappedInternationalOps,
+        caServiceCode: fetchedStartup.ca_service_code,
+        csServiceCode: fetchedStartup.cs_service_code,
+        investmentAdvisorCode: fetchedStartup.investment_advisor_code
+      };
+      
+      // Convert database format to Startup interface
+      const fundraisingRow = (fundraisingData?.data && (fundraisingData as any).data[0]) || null;
+      const startupObj: Startup = {
+        id: fetchedStartup.id,
+        name: fetchedStartup.name,
+        investmentType: fetchedStartup.investment_type,
+        // Prefer fundraising_details values when present
+        investmentValue: Number(fundraisingRow?.value ?? fetchedStartup.investment_value) || 0,
+        equityAllocation: Number(fundraisingRow?.equity ?? fetchedStartup.equity_allocation) || 0,
+        currentValuation: fetchedStartup.current_valuation,
+        complianceStatus: fetchedStartup.compliance_status,
+        sector: fundraisingRow?.domain || fetchedStartup.sector,
+        totalFunding: fetchedStartup.total_funding,
+        totalRevenue: fetchedStartup.total_revenue,
+        registrationDate: normalizeDate(fetchedStartup.registration_date),
+        currency: fundraisingRow?.currency || fetchedStartup.currency || 'USD',
+        founders: mappedFounders,
+        // Add share data
+        esopReservedShares: shares?.esop_reserved_shares || 0,
+        totalShares: shares?.total_shares || 0,
+        pricePerShare: shares?.price_per_share || 0,
+        // Add pitch materials from fundraising_details
+        pitchDeckUrl: fundraisingRow?.pitch_deck_url || undefined,
+        pitchVideoUrl: fundraisingRow?.pitch_video_url || undefined,
+        // Add profile data for ComplianceTab and ProfileTab
+        profile: profileData,
+        // Add direct profile fields for compatibility with components that check startup.country_of_registration
+        country_of_registration: fetchedStartup.country_of_registration || fetchedStartup.country,
+        company_type: fetchedStartup.company_type,
+        // Add user_id and investment_advisor_code for compatibility
+        user_id: fetchedStartup.user_id,
+        investment_advisor_code: fetchedStartup.investment_advisor_code,
+        ca_service_code: fetchedStartup.ca_service_code,
+        cs_service_code: fetchedStartup.cs_service_code
+      } as any;
+      
+      console.log('✅ Startup fetched from database with shares and founders:', startupObj);
+      console.log('📊 Share data:', shares);
+      console.log('👥 Founders data:', mappedFounders);
+      
+      // Set view-only mode for facilitator
+      setIsViewOnly(true);
+      setSelectedStartup(startupObj);
+      setView('startupHealth');
+      
+      // Store the target tab for the StartupHealthView to use
+      if (targetTab) {
+        (window as any).facilitatorTargetTab = targetTab;
+      }
+      
+      setViewKey(prev => prev + 1); // Force re-render
+      setForceRender(prev => prev + 1); // Additional force render
+      
+      // Force additional re-renders to ensure state changes are applied
+      setTimeout(() => {
+        console.log('🔍 Forcing additional re-render...');
+        setViewKey(prev => prev + 1);
+        setForceRender(prev => prev + 1);
+      }, 50);
+      
+      setTimeout(() => {
+        console.log('🔍 Forcing final re-render...');
+        setViewKey(prev => prev + 1);
+        setForceRender(prev => prev + 1);
+      }, 100);
+      
+      console.log('🔍 Facilitator startup access completed');
+    } catch (error) {
+      console.error('Error in facilitator startup access:', error);
+      messageService.error(
+        'Access Failed',
+        'Unable to access startup. Please try again.'
+      );
+    }
+  };
+
+  const handleBackToPortfolio = useCallback(() => {
+    // logDiagnostic disabled to prevent interference
+    setSelectedStartup(null);
+    setIsViewOnly(false);
+    setView('dashboard');
+    setViewKey(prev => prev + 1); // Force re-render
+  }, []);
+
+  // Add logging to view changes
+  const handleViewChange = useCallback((newView: 'startupHealth' | 'dashboard') => {
+    // logDiagnostic disabled to prevent interference
+    setView(newView);
+    setCookie('currentView', newView, 30);
+  }, [view]);
+
+  const handleAcceptStartupRequest = useCallback(async (requestId: number) => {
+    try {
+      // Find the startup request
+      const startupRequest = startupAdditionRequests.find(req => req.id === requestId);
+      if (!startupRequest) {
+        messageService.warning(
+          'Request Not Found',
+          'Startup request not found.'
+        );
+        return;
+      }
+
+      // Directly approve the request without subscription modal
+      console.log('🔍 Approving startup addition request:', requestId);
+      const newStartup = await startupAdditionService.acceptStartupRequest(requestId);
+      
+      console.log('✅ Startup approval successful:', {
+        startupId: newStartup.id,
+        startupName: newStartup.name,
+        requestId
+      });
+      
+      // Update local state - remove the approved request from the list
+      setStartupAdditionRequests(prev => {
+        const filtered = prev.filter(req => req.id !== requestId);
+        console.log('🔍 Updated startupAdditionRequests:', {
+          before: prev.length,
+          after: filtered.length,
+          removedId: requestId
+        });
+        return filtered;
+      });
+      
+      // Add startup to portfolio if not already present
+      setStartups(prev => {
+        const exists = prev.find(s => s.id === newStartup.id || s.name === newStartup.name);
+        if (exists) {
+          console.log('✅ Startup already in portfolio:', newStartup.name);
+          return prev;
+        }
+        console.log('✅ Adding startup to portfolio:', newStartup.name);
+        return [...prev, newStartup];
+      });
+      
+      messageService.success(
+        'Startup Added',
+        `${newStartup.name} has been added to your portfolio.`,
+        3000
+      );
+      
+      // Refresh data to ensure everything is up to date (including fetching updated requests)
+      console.log('🔄 Refreshing data after approval...');
+      await fetchData(true); // Force refresh
+    } catch (error) {
+      console.error('Error accepting startup request:', error);
+      messageService.error(
+        'Acceptance Failed',
+        'Failed to accept startup request. Please try again.'
+      );
+    }
+  }, [startupAdditionRequests, fetchData]);
+
+  // Removed empty useEffect hooks for optimization
+
+  
+  const handleActivateFundraising = useCallback((details: FundraisingDetails, startup: Startup) => {
+    const newOpportunity: NewInvestment = {
+      id: Date.now(),
+      name: startup.name,
+      investmentType: details.type,
+      investmentValue: details.value,
+      equityAllocation: details.equity,
+      sector: startup.sector,
+      totalFunding: startup.totalFunding,
+      totalRevenue: startup.totalRevenue,
+      registrationDate: startup.registrationDate,
+      pitchDeckUrl: details.pitchDeckUrl,
+      pitchVideoUrl: details.pitchVideoUrl,
+      complianceStatus: startup.complianceStatus,
+    };
+    setNewInvestments(prev => [newOpportunity, ...prev]);
+    
+    if (details.validationRequested) {
+        const newRequest: VerificationRequest = {
+            id: Date.now(),
+            startupId: startup.id,
+            startupName: startup.name,
+            requestDate: new Date().toISOString().split('T')[0],
+        };
+        setVerificationRequests(prev => [newRequest, ...prev]);
+        messageService.success(
+          'Startup Listed',
+          `${startup.name} is now listed for fundraising and a verification request has been sent to the admin.`,
+          3000
+        );
+    } else {
+        messageService.success(
+          'Startup Listed',
+          `${startup.name} is now listed for fundraising.`,
+          3000
+        );
+    }
+  }, []);
+
+  const handleInvestorAdded = useCallback(async (investment: InvestmentRecord, startup: Startup) => {
+      console.log('🔄 handleInvestorAdded called with:', { investment, startup });
+      console.log('🔍 Investment object keys:', Object.keys(investment));
+      console.log('🔍 Investment investor code:', investment.investorCode);
+      console.log('🔍 Current user investor codes:', { 
+          investor_code: (currentUser as any)?.investor_code, 
+          investorCode: (currentUser as any)?.investorCode 
+      });
+      
+      const normalizedInvestorCode = (currentUserRef.current as any)?.investor_code || (currentUserRef.current as any)?.investorCode || investment.investorCode;
+      console.log('🔍 Normalized investor code:', normalizedInvestorCode);
+      
+      if (!investment.investorCode) {
+          console.log('❌ No investor code found in investment, returning early');
+          return;
+      }
+      
+      console.log('✅ Investor code found, proceeding to create startup addition request...');
+      
+      try {
+          // Create an approval request for the investor who owns this code
+          const newRequest: StartupAdditionRequest = {
+              id: Date.now(),
+              name: startup.name,
+              investmentType: startup.investmentType,
+              investmentValue: investment.amount,
+              equityAllocation: investment.equityAllocated,
+              sector: startup.sector,
+              totalFunding: startup.totalFunding + investment.amount,
+              totalRevenue: startup.totalRevenue,
+              registrationDate: startup.registrationDate,
+              investorCode: investment.investorCode,
+              status: 'pending'
+          };
+          
+          // Save to database first
+          const savedRequest = await startupAdditionService.createStartupAdditionRequest({
+              name: startup.name,
+              investment_type: startup.investmentType,
+              investment_value: investment.amount,
+              equity_allocation: investment.equityAllocated,
+              sector: startup.sector,
+              total_funding: startup.totalFunding + investment.amount,
+              total_revenue: startup.totalRevenue,
+              registration_date: startup.registrationDate,
+              investor_code: investment.investorCode,
+              status: 'pending'
+          });
+          
+          // Update local state with the saved request (use database ID)
+          const requestWithDbId = { ...newRequest, id: savedRequest.id };
+          setStartupAdditionRequests(prev => [requestWithDbId, ...prev]);
+          
+          console.log('✅ Startup addition request created and saved to database:', savedRequest);
+          console.log('✅ Local state updated with request ID:', requestWithDbId.id);
+          
+          messageService.success(
+            'Request Created',
+            `Investor request created for ${startup.name}. It will appear in the investor's Approve Startup Requests.`,
+            3000
+          );
+      } catch (error) {
+          console.error('❌ Error creating startup addition request:', error);
+          messageService.error(
+            'Request Failed',
+            'Failed to create investor request. Please try again.'
+          );
+      }
+  }, []);
+
+  const handleUpdateFounders = useCallback((startupId: number, founders: Founder[]) => {
+    setStartups(prevStartups => 
+        prevStartups.map(s => 
+            s.id === startupId ? { ...s, founders } : s
+        )
+    );
+    if (selectedStartup?.id === startupId) {
+        setSelectedStartup(prev => prev ? { ...prev, founders } : null);
+    }
+    messageService.success(
+      'Founder Updated',
+      'Founder information updated successfully.',
+      3000
+    );
+  }, []);
+
+  const handleSubmitOffer = useCallback(async (opportunity: NewInvestment, offerAmount: number, equityPercentage: number, currency?: string, wantsCoInvestment?: boolean, coInvestmentOpportunityId?: number) => {
+    if (!currentUserRef.current) return;
+    
+    console.log('🔍 handleSubmitOffer called with:', {
+      opportunity: opportunity.name,
+      offerAmount,
+      equityPercentage,
+      currency,
+      wantsCoInvestment,
+      coInvestmentOpportunityId,
+      coInvestmentOpportunityIdType: typeof coInvestmentOpportunityId
+    });
+    
+    try {
+      // Check if user already has an offer for this startup
+      const existingOffers = await investmentService.getUserOffers(currentUserRef.current.email);
+      const existingOffer = existingOffers.find(offer => 
+        offer.startup_name === opportunity.name || 
+        offer.startup_id === opportunity.id
+      );
+      
+      if (existingOffer) {
+        // If there's an existing offer, ask user if they want to update it
+        const shouldUpdate = window.confirm(
+          `You already have an offer for ${opportunity.name}:\n` +
+          `Amount: ${existingOffer.offer_amount} ${existingOffer.currency || 'USD'}\n` +
+          `Equity: ${existingOffer.equity_percentage}%\n\n` +
+          `Do you want to update this offer with your new details?\n\n` +
+          `New Amount: ${offerAmount} ${currency || 'USD'}\n` +
+          `New Equity: ${equityPercentage}%\n` +
+          `Co-investment: ${wantsCoInvestment ? 'Yes' : 'No'}`
+        );
+        
+        if (shouldUpdate) {
+          // Update the existing offer
+          const updatedOffer = await investmentService.updateInvestmentOffer(existingOffer.id, {
+            offer_amount: offerAmount,
+            equity_percentage: equityPercentage,
+            currency: currency || 'USD',
+            wants_co_investment: wantsCoInvestment
+          });
+          
+          // Update local state
+          setInvestmentOffers(prev => 
+            prev.map(offer => 
+              offer.id === existingOffer.id ? { ...offer, ...updatedOffer } : offer
+            )
+          );
+          
+          // Notification removed - offer updated silently
+          
+          return;
+        } else {
+          // Notification removed - offer cancelled silently
+          return;
+        }
+      }
+      
+      // Use opportunity.id which is the new_investments.id
+      const createdOffer = await investmentService.createInvestmentOffer({
+        investor_email: currentUserRef.current.email,
+        startup_name: opportunity.name,
+        investment_id: opportunity.id, // This is the new_investments.id
+        offer_amount: offerAmount,
+        equity_percentage: equityPercentage,
+        currency: currency || 'USD',
+        co_investment_opportunity_id: coInvestmentOpportunityId // Track co-investment opportunity if this is a co-investment offer
+      });
+      
+      // Format the offer to match the InvestmentOffer interface format (camelCase)
+      // This ensures it displays correctly in the UI, especially for co-investment offers
+      const isCoInvestment = !!coInvestmentOpportunityId || !!(createdOffer as any).co_investment_opportunity_id;
+      
+      const formattedNewOffer: any = {
+        id: createdOffer.id,
+        investorEmail: createdOffer.investor_email || currentUserRef.current.email,
+        investorName: (createdOffer as any).investor_name || currentUserRef.current.name || undefined,
+        startupName: createdOffer.startup_name || opportunity.name,
+        startupId: (createdOffer as any).startup_id,
+        startup: (createdOffer as any).startup || null,
+        offerAmount: Number(createdOffer.offer_amount) || offerAmount,
+        equityPercentage: Number(createdOffer.equity_percentage) || equityPercentage,
+        status: createdOffer.status || 'pending',
+        currency: createdOffer.currency || currency || 'USD',
+        createdAt: createdOffer.created_at ? new Date(createdOffer.created_at).toISOString() : new Date().toISOString(),
+        // Co-investment fields
+        is_co_investment: isCoInvestment, // Flag to identify co-investment offers
+        co_investment_opportunity_id: createdOffer.co_investment_opportunity_id || coInvestmentOpportunityId || null,
+        lead_investor_approval_status: (createdOffer as any).lead_investor_approval_status || 'not_required',
+        lead_investor_approval_at: (createdOffer as any).lead_investor_approval_at,
+        investor_advisor_approval_status: (createdOffer as any).investor_advisor_approval_status || 'not_required',
+        investor_advisor_approval_at: (createdOffer as any).investor_advisor_approval_at,
+        startup_advisor_approval_status: (createdOffer as any).startup_advisor_approval_status || 'not_required',
+        startup_advisor_approval_at: (createdOffer as any).startup_advisor_approval_at,
+        stage: (createdOffer as any).stage || 1,
+        contact_details_revealed: (createdOffer as any).contact_details_revealed || false,
+        contact_details_revealed_at: (createdOffer as any).contact_details_revealed_at
+      };
+      
+      // Update local state
+      setInvestmentOffers(prev => [formattedNewOffer, ...prev]);
+      
+      // Handle co-investment offer flow - different from creating new co-investment opportunity
+      if (coInvestmentOpportunityId) {
+        // This is an offer for an existing co-investment opportunity
+        // The approval flow is handled by the createInvestmentOffer function
+        // Flow: Investor Advisor → Lead Investor → Startup
+        console.log('✅ Co-investment offer created with opportunity ID:', coInvestmentOpportunityId);
+        console.log('📋 Formatted offer for state:', formattedNewOffer);
+        console.log('🔍 Co-investment opportunity ID in formatted offer:', formattedNewOffer.co_investment_opportunity_id);
+      }
+      
+      // Handle co-investment logic if requested (creating NEW co-investment opportunity)
+      if (wantsCoInvestment && !coInvestmentOpportunityId) {
+        const remainingAmount = opportunity.investmentValue - offerAmount;
+        if (remainingAmount > 0) {
+          try {
+            console.log('🔄 Creating co-investment opportunity...');
+            
+            // For co-investment, we need to find the corresponding startup_id
+            // Since opportunity.id is from new_investments, we need to map it to startups
+            const { data: startupData, error: startupError } = await supabase
+              .from('startups')
+              .select('id, name')
+              .eq('name', opportunity.name)
+              .single();
+            
+            if (startupError || !startupData) {
+              console.error('❌ Startup not found for co-investment:', opportunity.name);
+              // Notification removed - startup not found error logged silently
+              return;
+            }
+            
+            console.log('✅ Found startup for co-investment:', startupData);
+            
+            await investmentService.createCoInvestmentOpportunity({
+              startup_id: startupData.id,
+              listed_by_user_id: currentUserRef.current.id,
+              listed_by_type: 'Investor',
+              investment_amount: opportunity.investmentValue,
+              equity_percentage: opportunity.equityAllocation,
+              minimum_co_investment: Math.min(remainingAmount * 0.1, 10000), // 10% of remaining or 10k minimum
+              maximum_co_investment: remainingAmount,
+              description: `Co-investment opportunity for ${opportunity.name}. Lead investor has committed ${currency || 'USD'} ${offerAmount.toLocaleString()} for ${equityPercentage}% equity. Remaining ${currency || 'USD'} ${remainingAmount.toLocaleString()} available for co-investors.`
+            });
+            
+            console.log('✅ Co-investment opportunity created successfully');
+            // Notification removed - co-investment created silently
+            
+          } catch (coInvestmentError) {
+            console.error('❌ Error creating co-investment opportunity:', coInvestmentError);
+            // Notification removed - co-investment error logged silently
+          }
+        }
+        // Notification removed - offer submitted silently
+      }
+    } catch (error) {
+      console.error('Error submitting offer:', error);
+      // Notification removed - error logged silently
+    }
+  }, []);
+
+  const handleProcessVerification = useCallback(async (requestId: number, status: 'approved' | 'rejected') => {
+    try {
+      const result = await verificationService.processVerification(requestId, status);
+      
+      if (result.success) {
+        // Update local state
+        setVerificationRequests(prev => prev.filter(r => r.id !== requestId));
+        
+        if (status === 'approved') {
+          messageService.success(
+            'Verification Approved',
+            'Verification request has been approved and startup is now "Startup Nation Verified".',
+            3000
+          );
+        } else {
+          messageService.warning(
+            'Verification Rejected',
+            'Verification request has been rejected.',
+            3000
+          );
+        }
+      }
+    } catch (error) {
+      console.error('Error processing verification:', error);
+      messageService.error(
+        'Processing Failed',
+        'Failed to process verification. Please try again.'
+      );
+    }
+  }, []);
+
+  const handleProcessOffer = useCallback(async (offerId: number, status: 'approved' | 'rejected' | 'accepted' | 'completed') => {
+    try {
+      await investmentService.updateOfferStatus(offerId, status);
+      
+      // Update local state
+      setInvestmentOffers(prev => prev.map(o => 
+        o.id === offerId ? { ...o, status } : o
+      ));
+      
+      const offer = investmentOffersRef.current.find(o => o.id === offerId);
+      if (offer) {
+        let message = `The offer for ${offer.startupName} from ${offer.investorEmail} has been ${status}.`;
+        
+        if (status === 'accepted') {
+          message += ' The investment deal is now finalized!';
+        } else if (status === 'completed') {
+          message += ' The investment transaction has been completed!';
+        }
+        
+        messageService.info(
+          'Offer Status',
+          message
+        );
+      }
+    } catch (error) {
+      console.error('Error processing offer:', error);
+      messageService.error(
+        'Processing Failed',
+        'Failed to process offer. Please try again.'
+      );
+    }
+  }, []);
+
+  const handleUpdateOffer = useCallback(async (offerId: number, offerAmount: number, equityPercentage: number) => {
+    try {
+      console.log('Attempting to update offer:', { offerId, offerAmount, equityPercentage });
+      
+      const updatedOffer = await investmentService.updateInvestmentOffer(offerId, offerAmount, equityPercentage);
+      
+      // Update local state
+      setInvestmentOffers(prev => prev.map(o => 
+        o.id === offerId ? { ...o, offerAmount, equityPercentage } : o
+      ));
+      
+      messageService.success(
+        'Offer Updated',
+        'Offer updated successfully!',
+        3000
+      );
+    } catch (error) {
+      console.error('Error updating offer:', error);
+      
+      // Show more specific error message
+      let errorMessage = 'Failed to update offer. Please try again.';
+      if (error instanceof Error) {
+        errorMessage = `Update failed: ${error.message}`;
+      } else if (typeof error === 'object' && error !== null) {
+        errorMessage = `Update failed: ${JSON.stringify(error)}`;
+      }
+      
+      messageService.error(
+        'Submission Failed',
+        errorMessage
+      );
+    }
+  }, []);
+
+  const handleCancelOffer = useCallback(async (offerId: number) => {
+    try {
+      await investmentService.deleteInvestmentOffer(offerId);
+      
+      // Update local state
+      setInvestmentOffers(prev => prev.filter(o => o.id !== offerId));
+      
+      messageService.success(
+        'Offer Cancelled',
+        'Offer cancelled successfully!',
+        3000
+      );
+    } catch (error) {
+      console.error('Error cancelling offer:', error);
+      messageService.error(
+        'Cancellation Failed',
+        'Failed to cancel offer. Please try again.'
+      );
+    }
+  }, []);
+
+  const handleProcessValidationRequest = useCallback(async (requestId: number, status: 'approved' | 'rejected', notes?: string) => {
+    try {
+      const updatedRequest = await validationService.processValidationRequest(requestId, status, notes);
+      
+      // Update local state
+      setValidationRequests(prev => prev.map(r => 
+        r.id === requestId ? updatedRequest : r
+      ));
+      
+      const request = validationRequestsRef.current.find(r => r.id === requestId);
+      if (request) {
+        messageService.success(
+          'Validation Processed',
+          `The validation request for ${request.startupName} has been ${status}.`,
+          3000
+        );
+      }
+    } catch (error) {
+      console.error('Error processing validation request:', error);
+      messageService.error(
+        'Processing Failed',
+        'Failed to process validation request. Please try again.'
+      );
+    }
+  }, []);
+
+  const handleUpdateCompliance = useCallback(async (startupId: number, status: ComplianceStatus) => {
+    try {
+      console.log(`🔄 Updating compliance status for startup ${startupId} to: ${status}`);
+      console.log(`📊 Status type: ${typeof status}, Value: "${status}"`);
+      
+      // First, let's check if the startup actually exists in the database
+      const { data: existingStartup, error: checkError } = await supabase
+        .from('startups')
+        .select('id, name, compliance_status')
+        .eq('id', startupId)
+        .single();
+      
+      if (checkError) {
+        console.error('❌ Error checking startup existence:', checkError);
+        throw new Error(`Startup with ID ${startupId} not found in database`);
+      }
+      
+      console.log('🔍 Found startup in database:', existingStartup);
+      console.log('🔍 Current database status:', existingStartup.compliance_status);
+      
+      // For CA compliance updates, we need to update the compliance_checks table
+      // This function is called from CA dashboard when updating overall compliance
+      const { data, error } = await supabase
+        .from('startups')
+        .update({ compliance_status: status })
+        .eq('id', startupId)
+        .select(); // Add select to see what was updated
+      
+      if (error) {
+        console.error('❌ Database update error:', error);
+        console.error('❌ Error details:', {
+          code: error.code,
+          message: error.message,
+          details: error.details,
+          hint: error.hint
+        });
+        throw error;
+      }
+      
+      console.log('✅ Database update successful:', data);
+      console.log('✅ Rows affected:', data.length);
+      
+      if (data.length === 0) {
+        throw new Error(`No rows were updated. Startup ID ${startupId} may not exist or have different permissions.`);
+      }
+      
+      // Update local state
+      setStartups(prev => prev.map(s => 
+        s.id === startupId ? { ...s, complianceStatus: status } : s
+      ));
+      
+      // Get startup name for alert
+      const startup = startupsRef.current.find(s => s.id === startupId);
+      const startupName = startup?.name || 'Startup';
+      
+      console.log(`✅ Successfully updated ${startupName} compliance status to ${status}`);
+      messageService.success(
+        'Compliance Updated',
+        `${startupName} compliance status has been updated to ${status}.`,
+        3000
+      );
+    } catch (error) {
+      console.error('❌ Error updating compliance:', error);
+      messageService.error(
+        'Update Failed',
+        `Failed to update compliance status: ${error.message || 'Unknown error'}. Please try again.`
+      );
+    }
+  }, []);
+
+  const handleProfileUpdate = useCallback((updatedUser: any) => {
+    console.log('🚨 handleProfileUpdate called - this might trigger refresh');
+    // Update the currentUser state with the new profile data
+    setCurrentUser(prevUser => ({
+      ...prevUser,
+      ...updatedUser
+    }));
+    console.log('✅ Profile updated in App.tsx:', updatedUser);
+  }, []);
+
+  const getPanelTitle = () => {
+    return 'TrackMyStartup';
+  }
+
+
+
+  if (isLoading && !selectedStartup && currentPage !== 'login' && currentPage !== 'register') {
+      console.log('Rendering loading screen...', { isAuthenticated, currentUser: !!currentUser });
+      return (
+          <div className="flex items-center justify-center min-h-screen bg-slate-50 text-brand-primary">
+              <div className="flex flex-col items-center gap-4">
+                  <BarChart3 className="w-16 h-16 animate-pulse" />
+                  <p className="text-xl font-semibold">Loading Application...</p>
+                  <p className="text-sm text-slate-600">
+                    Auth: {isAuthenticated ? 'Yes' : 'No'} | 
+                    User: {currentUser ? 'Yes' : 'No'} | 
+                    Role: {currentUser?.role || 'None'}
+                  </p>
+                  {loadingProgress && (
+                      <p className="text-sm text-slate-600">{loadingProgress}</p>
+                  )}
+                  {/* Safety control so users aren't stuck on mobile */}
+                  <div className="mt-2">
+                    <button
+                      onClick={() => { try { window.location.reload(); } catch {} }}
+                      className="px-3 py-1.5 bg-blue-600 text-white rounded-md text-sm"
+                    >
+                      Refresh
+                    </button>
+                  </div>
+              </div>
+          </div>
+      )
+  }
+
+  // Subscription page removed (always allow dashboard)
+
+
+
+  // Check if we need to show complete-registration page (even when authenticated)
+  if (currentPage === 'complete-registration') {
+    console.log('🎯 Showing CompleteRegistrationPage (Form 2)');
+    return (
+      <div className="min-h-screen bg-slate-100 flex flex-col">
+        <div className="flex-1 flex items-center justify-center">
+          <CompleteRegistrationPage 
+            onNavigateToRegister={() => setCurrentPage('register')}
+            onNavigateToDashboard={async () => {
+              console.log('🔄 Registration completed, refreshing user data first...');
+              
+              // CRITICAL: Refresh user data FIRST before any checks
+              try {
+                const refreshedUser = await authService.getCurrentUser();
+                if (refreshedUser) {
+                  console.log('✅ User data refreshed after Form 2 completion:', refreshedUser);
+                  setCurrentUser(refreshedUser);
+                  setIsAuthenticated(true);
+                  
+                  setCurrentPage('login'); // This will show the main dashboard
+                } else {
+                  console.error('❌ Failed to refresh user data after Form 2 completion');
+                  // Fallback: still try to navigate
+                  setIsAuthenticated(true);
+                  setCurrentPage('login');
+                }
+              } catch (error) {
+                console.error('❌ Error refreshing user data after Form 2 completion:', error);
+                // Fallback: still try to navigate
+                setIsAuthenticated(true);
+                setCurrentPage('login');
+              }
+            }}
+          />
+        </div>
+        {/* Footer for complete-registration page */}
+        <Footer />
+      </div>
+    );
+  }
+
+
+  // Check if we need to show reset-password page
+  if (currentPage === 'reset-password') {
+    console.log('🎯 Showing ResetPasswordPage');
+    return (
+      <div className="min-h-screen bg-slate-100 flex flex-col">
+        <div className="flex-1 flex items-center justify-center">
+          <ResetPasswordPage 
+            onNavigateToLogin={() => setCurrentPage('login')}
+          />
+        </div>
+        {/* Footer for reset-password page */}
+        <Footer />
+      </div>
+    );
+  }
+
+  console.log('🔍 App.tsx render - currentPage:', currentPage, 'isAuthenticated:', isAuthenticated);
+  
+  // Show public program view if on /program with opportunityId (BEFORE auth check)
+  if (isPublicProgramView) {
+    return <PublicProgramView />;
+  }
+  
+  if (!isAuthenticated) {
+    return (
+        <div className="min-h-screen bg-slate-100 flex flex-col">
+            <div className="flex-1 flex items-center justify-center">
+                {currentPage === 'login' ? (
+                    <LoginPage 
+                        onLogin={handleLogin} 
+                        onNavigateToRegister={() => setCurrentPage('register')} 
+                        onNavigateToCompleteRegistration={() => {
+                            console.log('🔄 Navigating to complete-registration page');
+                            setCurrentPage('complete-registration');
+                        }}
+                    />
+                ) : currentPage === 'register' ? (
+                    <TwoStepRegistration 
+                        onRegister={handleRegister} 
+                        onNavigateToLogin={() => setCurrentPage('login')} 
+                    />
+                ) : (
+                    <CompleteRegistrationPage 
+                      onNavigateToRegister={() => setCurrentPage('register')}
+                      onNavigateToDashboard={async () => {
+                        console.log('🔄 Navigating to dashboard after registration completion');
+                        // Refresh the current user data to get updated Investment Advisor code and logo
+                        try {
+                          const refreshedUser = await authService.getCurrentUser();
+                          if (refreshedUser) {
+                            console.log('✅ User data refreshed for dashboard:', refreshedUser);
+                            setCurrentUser(refreshedUser);
+                            setIsAuthenticated(true);
+                            setCurrentPage('login'); // This will show the main dashboard
+                            // Force refresh startup data after registration
+                            console.log('🔄 Forcing startup data refresh after registration...');
+                            setTimeout(() => {
+                              fetchData(true); // Force refresh with true parameter
+                            }, 1000); // Small delay to ensure database transaction is committed
+                          }
+                        } catch (error) {
+                          console.error('❌ Error refreshing user data:', error);
+                          // Still navigate even if refresh fails
+                          setIsAuthenticated(true);
+                          setCurrentPage('login');
+                        }
+                      }}
+                    />
+                )}
+            </div>
+        </div>
+    )
+  }
+
+
+  const MainContent = () => {
+    // Wait for user role to be loaded before showing role-based views
+    if (isAuthenticated && currentUser && !currentUser.role) {
+      return (
+        <div className="flex items-center justify-center min-h-[400px]">
+          <div className="text-center">
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-brand-primary mx-auto mb-4"></div>
+            <p className="text-slate-600">Loading your dashboard...</p>
+          </div>
+        </div>
+      );
+    }
+
+
+    // If a startup is selected for detailed view, show it regardless of role
+    if (view === 'startupHealth' && selectedStartup) {
+      return (
+        <StartupHealthView 
+          startup={selectedStartup}
+          userRole={currentUser?.role}
+          user={currentUser}
+          onBack={handleBackToPortfolio}
+          onActivateFundraising={handleActivateFundraising}
+          onInvestorAdded={handleInvestorAdded}
+          onUpdateFounders={handleUpdateFounders}
+          isViewOnly={isViewOnly}
+          investmentOffers={investmentOffers}
+          onProcessOffer={handleProcessOffer}
+        />
+      );
+    }
+
+
+    // Role-based views
+    if (currentUser?.role === 'Admin') {
+      return (
+        <AdminView
+          users={users}
+          startups={startups}
+          verificationRequests={verificationRequests}
+          investmentOffers={investmentOffers}
+          validationRequests={validationRequests}
+          onProcessVerification={handleProcessVerification}
+          onProcessOffer={handleProcessOffer}
+          onProcessValidationRequest={handleProcessValidationRequest}
+          onViewStartup={handleViewStartup}
+        />
+      );
+    }
+
+    if (currentUser?.role === 'CA') {
+      return (
+        <CAView
+          startups={startups}
+          onUpdateCompliance={handleUpdateCompliance}
+          onViewStartup={handleViewStartup}
+          currentUser={currentUser}
+          onProfileUpdate={handleProfileUpdate}
+          onLogout={handleLogout}
+        />
+      );
+    }
+
+    if (currentUser?.role === 'CS') {
+      return (
+        <CSView
+          startups={startups}
+          onUpdateCompliance={handleUpdateCompliance}
+          onViewStartup={handleViewStartup}
+          currentUser={currentUser}
+          onProfileUpdate={handleProfileUpdate}
+          onLogout={handleLogout}
+        />
+      );
+    }
+
+    if (currentUser?.role === 'Startup Facilitation Center') {
+      return (
+        <FacilitatorView
+          startups={startups}
+          newInvestments={newInvestments}
+          startupAdditionRequests={startupAdditionRequests}
+          onViewStartup={handleViewStartup}
+          onAcceptRequest={handleAcceptStartupRequest}
+          currentUser={currentUser}
+          onProfileUpdate={handleProfileUpdate}
+          onLogout={handleLogout}
+        />
+      );
+    }
+
+    if (currentUser?.role === 'Investment Advisor') {
+      return (
+        <InvestmentAdvisorView
+          currentUser={currentUser}
+          users={users}
+          startups={startups}
+          investments={newInvestments}
+          offers={investmentOffers}
+          interests={[]} // TODO: Add investment interests data
+          pendingRelationships={pendingRelationships}
+          onViewStartup={handleViewStartup}
+        />
+      );
+    }
+
+    if (currentUser?.role === 'Investor') {
+      return (
+        <InvestorView 
+          startups={startups} 
+          newInvestments={newInvestments}
+          startupAdditionRequests={startupAdditionRequests}
+          investmentOffers={investmentOffers}
+          currentUser={currentUser}
+          onViewStartup={handleViewStartup}
+          onAcceptRequest={handleAcceptStartupRequest}
+          onMakeOffer={handleSubmitOffer}
+          onUpdateOffer={handleUpdateOffer}
+          onCancelOffer={handleCancelOffer}
+        />
+      );
+    }
+
+    if (currentUser?.role === 'Startup') {
+      // Memoized startup lookup for better performance
+      const userStartup = useMemo(() => {
+        // Find the user's startup by startup_name from users table
+        let found = startups.find(startup => startup.name === currentUser.startup_name);
+        // Fallback: if no match but exactly one startup is available, pick it
+        if (!found && startups.length === 1) {
+          found = startups[0];
+        }
+        return found;
+      }, [startups, currentUser.startup_name]);
+      
+      
+      // User startup data processed
+      
+      // Show subscription page if user needs to subscribe
+      // Subscription page removed entirely
+
+      // SIMPLIFIED: Skip loading check for faster access
+      // TODO: Re-enable once database is working properly
+      /*
+      if (userHasAccess === null || isCheckingSubscription) {
+        return (
+          <div className="min-h-screen flex items-center justify-center bg-gray-50">
+            <div className="text-center">
+              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
+              <p className="text-gray-600">Checking access...</p>
+              <p className="text-sm text-gray-500 mt-2">Setting up your 5-minute free trial</p>
+            </div>
+          </div>
+        );
+      }
+      */
+
+      
+      // If user's startup is found, show the health view
+      if (userStartup) {
+        return (
+          <StartupHealthView 
+            startup={userStartup}
+            userRole={currentUser?.role}
+            user={currentUser}
+            onBack={() => {}} // No back button needed for startup users
+            onActivateFundraising={handleActivateFundraising}
+            onInvestorAdded={handleInvestorAdded}
+            onUpdateFounders={handleUpdateFounders}
+            investmentOffers={investmentOffers}
+            onProcessOffer={handleProcessOffer}
+          />
+        );
+      }
+      
+      // If no startup found, only show the message AFTER initial data has fully loaded.
+      // During quick tab switches or initial load, keep the previous UI (no flashing).
+      if (hasInitialDataLoaded) {
+        // Robust mobile recovery: perform up to 3 background attempts before showing the message
+        const now = Date.now();
+        const shouldAttempt =
+          startupRecoveryAttemptsRef.current < 3 &&
+          (now - startupRecoveryLastAtRef.current > 2000); // at most every 2s
+
+        if (shouldAttempt) {
+          startupRecoveryAttemptsRef.current += 1;
+          startupRecoveryLastAtRef.current = now;
+          startupRecoveryAttemptedRef.current = true;
+          (async () => {
+            try {
+              console.log(`🔍 Recovery attempt #${startupRecoveryAttemptsRef.current}: fetching startup by user_id...`);
+              const { data: startupsByUser, error: startupsByUserError } = await authService.supabase
+                .from('startups')
+                .select('*')
+                .eq('user_id', currentUser.id);
+              if (!startupsByUserError && startupsByUser && startupsByUser.length > 0) {
+                console.log('✅ Recovery success: found startups by user_id');
+                setStartups(startupsByUser as any);
+                setSelectedStartup(startupsByUser[0] as any);
+                setView('startupHealth');
+                // Persist startup_name for future refreshes
+                try {
+                  await authService.supabase
+                    .from('users')
+                    .update({ startup_name: (startupsByUser[0] as any).name })
+                    .eq('id', currentUser.id);
+                } catch {}
+                return;
+              }
+              console.log('❌ Recovery: still no startup by user_id');
+            } catch (e) {
+              console.warn('⚠️ Recovery fetch failed (non-blocking):', e);
+            }
+          })();
+          // Keep showing a spinner while recovery is running
+          return (
+            <div className="flex items-center justify-center min-h-[200px]">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-brand-primary" />
+            </div>
+          );
+        }
+        console.log('❌ No startup found for user:', currentUser.email);
+        return (
+          <div className="text-center py-20">
+            <h2 className="text-xl font-semibold">No Startup Found</h2>
+            <p className="text-slate-500 mt-2">No startup associated with your account. Please contact support.</p>
+            <div className="mt-4 text-sm text-slate-400">
+              <p>Debug Info:</p>
+              <p>User startup_name: {currentUser.startup_name || 'NULL'}</p>
+              <p>Available startups: {startups.length}</p>
+            </div>
+          </div>
+        );
+      }
+      // Not loaded yet: preserve screen without showing fallback
+      return (
+        <div className="flex items-center justify-center min-h-[200px]">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-brand-primary" />
+        </div>
+      );
+    }
+
+    // Default fallback
+    return (
+      <div className="text-center py-20">
+        <h2 className="text-xl font-semibold">TrackMyStartup - Welcome, {currentUser?.email}</h2>
+        <p className="text-slate-500 mt-2">Startup user view - select a startup to view details.</p>
+      </div>
+    );
+  };
+
+  // Main authenticated view
+  return (
+      <>
+        <MessageContainer />
+        <div className="min-h-screen bg-slate-100 text-slate-800 flex flex-col">
+        <header className="bg-white shadow-sm sticky top-0 z-50">
+          <div className="container mx-auto px-3 sm:px-4 lg:px-6 py-2 flex justify-between items-center">
+            <div className="flex items-center gap-2">
+              {/* Show investment advisor logo if user is an Investment Advisor OR has an assigned investment advisor */}
+              {(() => {
+                const isInvestmentAdvisor = currentUser?.role === 'Investment Advisor' && (currentUser as any)?.logo_url;
+                const hasAssignedAdvisor = assignedInvestmentAdvisor && (currentUser?.role === 'Investor' || currentUser?.role === 'Startup');
+                const shouldShowAdvisorLogo = Boolean(isInvestmentAdvisor || hasAssignedAdvisor);
+                
+                console.log('🔍 Header logo display check:', {
+                  currentUserRole: currentUser?.role,
+                  currentUserLogo: (currentUser as any)?.logo_url,
+                  assignedAdvisor: !!assignedInvestmentAdvisor,
+                  assignedAdvisorLogo: assignedInvestmentAdvisor?.logo_url,
+                  isInvestmentAdvisor,
+                  hasAssignedAdvisor,
+                  shouldShowAdvisorLogo
+                });
+                return shouldShowAdvisorLogo;
+              })() ? (
+                <div className="flex items-center gap-3">
+                  {((currentUser?.role === 'Investment Advisor' && (currentUser as any)?.logo_url) || 
+                    (assignedInvestmentAdvisor?.logo_url)) ? (
+                    <>
+                      <img 
+                        src={currentUser?.role === 'Investment Advisor' 
+                          ? (currentUser as any).logo_url 
+                          : assignedInvestmentAdvisor?.logo_url} 
+                        alt="Company Logo" 
+                        className="h-24 w-24 sm:h-28 sm:w-28 rounded object-contain bg-white border border-gray-200 p-1"
+                        onError={(e) => {
+                          // Fallback to TrackMyStartup logo if image fails to load
+                          e.currentTarget.style.display = 'none';
+                          e.currentTarget.nextElementSibling?.classList.remove('hidden');
+                        }}
+                      />
+                      <img src={LogoTMS} alt="TrackMyStartup" className="h-24 w-24 sm:h-28 sm:w-28 object-contain hidden" />
+                    </>
+                  ) : (
+                    <div className="h-24 w-24 sm:h-28 sm:w-28 rounded bg-purple-100 border border-purple-200 flex items-center justify-center">
+                      <span className="text-purple-600 font-semibold text-base sm:text-lg">IA</span>
+                    </div>
+                  )}
+                  <div>
+                    <h1 className="text-lg font-semibold text-gray-800">
+                      {currentUser?.role === 'Investment Advisor' 
+                        ? (currentUser as any).name || 'Investment Advisor'
+                        : assignedInvestmentAdvisor?.name || 'Investment Advisor'}
+                    </h1>
+                    <p className="text-xs text-blue-600">Supported by Track My Startup</p>
+                  </div>
+                </div>
+              ) : (
+                <img src={LogoTMS} alt="TrackMyStartup" className="h-24 w-24 sm:h-28 sm:w-28 object-contain" />
+              )}
+            </div>
+             <div className="flex items-center gap-3">
+              {currentUser?.role === 'Investor' && (
+                  <div className="hidden sm:block text-sm text-slate-500 bg-slate-100 px-3 py-1.5 rounded-md font-mono">
+                      Investor Code: <span className="font-semibold text-brand-primary">
+                          {currentUser.investor_code || currentUser.investorCode || 'Not Set'}
+                      </span>
+                      {!currentUser.investor_code && !currentUser.investorCode && (
+                          <span className="text-red-500 text-xs ml-2">⚠️ Code missing</span>
+                      )}
+                  </div>
+              )}
+
+              {currentUser?.role === 'Startup Facilitation Center' && (
+                  <FacilitatorCodeDisplay 
+                      className="bg-blue-100 text-blue-800 px-3 py-1 rounded-md text-sm font-medium" 
+                      currentUser={currentUser}
+                  />
+              )}
+
+              {currentUser?.role === 'Investment Advisor' && (
+                  <div className="hidden sm:block text-sm text-slate-500 bg-slate-100 px-3 py-1.5 rounded-md font-mono">
+                      Advisor Code: <span className="font-semibold text-brand-primary">
+                          {(currentUser as any)?.investment_advisor_code || 'IA-XXXXXX'}
+                      </span>
+                  </div>
+              )}
+
+              {(currentUser?.role === 'Investor' || currentUser?.role === 'Startup') && currentUser?.investment_advisor_code_entered && (
+                  <div className="hidden sm:block text-sm text-slate-500 bg-purple-100 px-3 py-1.5 rounded-md font-mono">
+                      Advisor: <span className="font-semibold text-purple-800">
+                          {currentUser.investment_advisor_code_entered}
+                      </span>
+                  </div>
+              )}
+
+              <button onClick={handleLogout} className="flex items-center gap-2 text-sm font-medium text-slate-600 hover:text-brand-primary transition-colors">
+                  <LogOut className="h-4 w-4" />
+                  Logout
+              </button>
+             </div>
+          </div>
+        </header>
+        
+        {/* Error Display */}
+        {error && (
+          <div className="bg-red-50 border border-red-200 rounded-md p-4 mx-4 mt-4">
+            <div className="flex items-center">
+              <div className="text-sm text-red-800">
+                <strong>Error:</strong> {error}
+              </div>
+              <button 
+                onClick={() => setError(null)} 
+                className="ml-auto text-red-600 hover:text-red-800"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+        )}
+        
+        <main className="container mx-auto p-4 sm:p-6 lg:p-8 flex-1">
+          <MainContent key={`${viewKey}-${forceRender}`} />
+        </main>
+      
+        {/* Razorpay Subscription Modal removed */}
+
+        {/* Trial Subscription Modal removed */}
+      
+      {/* Footer removed - only shows on landing page */}
+      <Analytics />
+        </div>
+      </>
+    );
+};
+
+export default App;
