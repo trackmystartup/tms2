@@ -30,8 +30,6 @@ export default defineConfig(({ mode }) => {
       build: {
         outDir: 'dist',
         assetsDir: 'assets',
-        // Ensure 404.html is copied during build
-        copyPublicDir: true,
         rollupOptions: {
           output: {
             manualChunks: {
@@ -39,14 +37,14 @@ export default defineConfig(({ mode }) => {
               charts: ['recharts'],
               ui: ['lucide-react'],
               supabase: ['@supabase/supabase-js'],
-              // Analytics can be added here if needed
+              analytics: ['@vercel/analytics']
             },
           },
         },
-        // Use esbuild (default) for fast builds
+        // Use esbuild (default) to avoid optional terser dependency on Vercel
         minify: 'esbuild',
         sourcemap: false,
-        // Ensure compatibility with modern browsers
+        // Ensure compatibility with Vercel's build environment
         target: 'esnext',
         modulePreload: {
           polyfill: false

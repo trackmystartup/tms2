@@ -51,25 +51,9 @@ export async function withRetry<T>(
 
 export function handleError(error: any, context?: string): string {
   const errorMessage = error?.message || error?.error?.message || 'An unexpected error occurred';
-  const errorCode = error?.code || error?.error?.code;
-  const statusCode = error?.status || error?.statusCode;
   
   if (process.env.NODE_ENV === 'development') {
     console.error(`[${context || 'Error'}]`, error);
-  }
-
-  // Handle 404 NOT_FOUND errors specifically
-  if (statusCode === 404 || errorCode === 'PGRST116' || errorCode === 'NOT_FOUND' || errorMessage.includes('NOT_FOUND')) {
-    if (errorMessage.includes('rpc') || errorMessage.includes('function')) {
-      return 'Database function not found. Please contact support.';
-    }
-    if (errorMessage.includes('table') || errorMessage.includes('relation')) {
-      return 'Database table not found. Please contact support.';
-    }
-    if (errorMessage.includes('bucket') || errorMessage.includes('storage')) {
-      return 'Storage bucket not found. Please contact support.';
-    }
-    return 'Resource not found. The requested item may have been removed or does not exist.';
   }
 
   // User-friendly error messages
