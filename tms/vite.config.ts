@@ -37,14 +37,14 @@ export default defineConfig(({ mode }) => {
               charts: ['recharts'],
               ui: ['lucide-react'],
               supabase: ['@supabase/supabase-js'],
-              analytics: ['@vercel/analytics']
+              // Analytics can be added here if needed
             },
           },
         },
-        // Use esbuild (default) to avoid optional terser dependency on Vercel
+        // Use esbuild (default) for fast builds
         minify: 'esbuild',
         sourcemap: false,
-        // Ensure compatibility with Vercel's build environment
+        // Ensure compatibility with modern browsers
         target: 'esnext',
         modulePreload: {
           polyfill: false

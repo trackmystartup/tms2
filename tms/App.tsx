@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
-import { Analytics } from '@vercel/analytics/react';
+// Analytics - Optional: Remove @vercel/analytics or replace with Netlify Analytics
+// import { Analytics } from '@vercel/analytics/react';
 import { Startup, NewInvestment, ComplianceStatus, StartupAdditionRequest, FundraisingDetails, InvestmentRecord, InvestmentType, UserRole, Founder, User, VerificationRequest, InvestmentOffer } from './types';
 import { authService, AuthUser } from './lib/auth';
 import { startupService, investmentService, verificationService, userService, realtimeService, startupAdditionService } from './lib/database';
@@ -2762,7 +2763,8 @@ const App: React.FC = () => {
         {/* Trial Subscription Modal removed */}
       
       {/* Footer removed - only shows on landing page */}
-      <Analytics />
+      {/* Analytics - Removed for Netlify deployment. Add Netlify Analytics if needed. */}
+      {/* <Analytics /> */}
         </div>
       </>
     );
