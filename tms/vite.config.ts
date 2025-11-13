@@ -30,6 +30,8 @@ export default defineConfig(({ mode }) => {
       build: {
         outDir: 'dist',
         assetsDir: 'assets',
+        // Ensure 404.html is copied during build
+        copyPublicDir: true,
         rollupOptions: {
           output: {
             manualChunks: {

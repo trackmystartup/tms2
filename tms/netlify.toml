@@ -13,12 +13,20 @@
     NODE_VERSION = "18"
 
 # Redirects and rewrites for SPA routing
-# This ensures all routes are handled by React Router
-# Note: Netlify also supports _redirects file in the publish directory
+# This ensures all routes are handled by the client-side router
+# Exclude static assets from redirect
+[[redirects]]
+  from = "/assets/*"
+  to = "/assets/:splat"
+  status = 200
+  force = true
+
+# Redirect all other routes to index.html for SPA routing
 [[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200
+  force = false
 
 # Headers for security and performance
 [[headers]]

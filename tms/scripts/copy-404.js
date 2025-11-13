@@ -22,13 +22,37 @@ try {
   }
 
   // Copy _redirects file to dist folder for Netlify
-  if (fs.existsSync(redirectsSourcePath)) {
-    fs.copyFileSync(redirectsSourcePath, redirectsDestPath);
-    console.log('✅ Successfully copied _redirects file to dist folder');
-  } else {
+  // Try multiple locations
+  const redirectsPaths = [
+    path.join(__dirname, '..', '_redirects'),
+    path.join(__dirname, '..', 'public', '_redirects'),
+  ];
+  
+  let redirectsCopied = false;
+  for (const sourcePath of redirectsPaths) {
+    if (fs.existsSync(sourcePath)) {
+      fs.copyFileSync(sourcePath, redirectsDestPath);
+      console.log(`✅ Successfully copied _redirects file from ${path.basename(path.dirname(sourcePath))} to dist folder`);
+      redirectsCopied = true;
+      break;
+    }
+  }
+  
+  if (!redirectsCopied) {
     // Create _redirects file if it doesn't exist
-    fs.writeFileSync(redirectsDestPath, '/*    /index.html   200\n');
+    const redirectsContent = '/*    /index.html   200\n';
+    fs.writeFileSync(redirectsDestPath, redirectsContent);
     console.log('✅ Created _redirects file in dist folder');
+  }
+  
+  // Verify _redirects file exists and has correct content
+  if (fs.existsSync(redirectsDestPath)) {
+    const content = fs.readFileSync(redirectsDestPath, 'utf8');
+    if (!content.includes('/index.html')) {
+      console.warn('⚠️  _redirects file exists but may have incorrect content');
+    } else {
+      console.log('✅ Verified _redirects file content is correct');
+    }
   }
 } catch (error) {
   console.error('❌ Error copying files:', error.message);
