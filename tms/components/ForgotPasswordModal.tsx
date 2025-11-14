@@ -15,20 +15,57 @@ const ForgotPasswordModal: React.FC<ForgotPasswordModalProps> = ({ isOpen, onClo
   const [isLoading, setIsLoading] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [submittedEmail, setSubmittedEmail] = useState(''); // Store email for success message
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsLoading(true);
     setError(null);
 
+    // Basic email validation
+    if (!email.trim()) {
+      setError('Please enter your email address.');
+      setIsLoading(false);
+      return;
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email.trim())) {
+      setError('Please enter a valid email address.');
+      setIsLoading(false);
+      return;
+    }
+
     try {
-      const { success, error: resetError } = await authService.sendPasswordResetEmail(email);
+      // Check if email exists first
+      const emailCheck = await authService.checkEmailExists(email.trim());
+      
+      if (!emailCheck.exists) {
+        setError('No account found with this email address. Please check your email and try again.');
+        setIsLoading(false);
+        return;
+      }
+
+      const { success, error: resetError } = await authService.sendPasswordResetEmail(email.trim());
       
       if (success) {
+        setSubmittedEmail(email.trim()); // Store email before clearing
         setIsSuccess(true);
         setEmail(''); // Clear email for security
       } else {
-        setError(resetError || 'Failed to send password reset email. Please try again.');
+        // Provide more specific error messages
+        let errorMessage = resetError || 'Failed to send password reset email. Please try again.';
+        
+        // Handle common Supabase errors
+        if (resetError?.includes('rate limit') || resetError?.includes('too many requests')) {
+          errorMessage = 'Too many requests. Please wait a few minutes before trying again.';
+        } else if (resetError?.includes('invalid') || resetError?.includes('not found')) {
+          errorMessage = 'No account found with this email address. Please check your email and try again.';
+        } else if (resetError?.includes('redirect')) {
+          errorMessage = 'Configuration error. Please contact support.';
+        }
+        
+        setError(errorMessage);
       }
     } catch (err: any) {
       console.error('Password reset error:', err);
@@ -42,6 +79,7 @@ const ForgotPasswordModal: React.FC<ForgotPasswordModalProps> = ({ isOpen, onClo
     setEmail('');
     setError(null);
     setIsSuccess(false);
+    setSubmittedEmail('');
     onClose();
   };
 
@@ -49,6 +87,7 @@ const ForgotPasswordModal: React.FC<ForgotPasswordModalProps> = ({ isOpen, onClo
     setEmail('');
     setError(null);
     setIsSuccess(false);
+    setSubmittedEmail('');
   };
 
   return (
@@ -126,7 +165,7 @@ const ForgotPasswordModal: React.FC<ForgotPasswordModalProps> = ({ isOpen, onClo
               Check your email
             </h3>
             <p className="text-sm text-slate-600">
-              We've sent a password reset link to <strong>{email}</strong>
+              We've sent a password reset link to <strong>{submittedEmail}</strong>
             </p>
           </div>
 

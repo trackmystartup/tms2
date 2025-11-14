@@ -110,25 +110,59 @@ export const authService = {
     try {
       console.log('Sending password reset email to:', email);
       
+      // Validate email format
+      if (!email || !email.trim()) {
+        return { success: false, error: 'Email address is required.' };
+      }
+
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(email.trim())) {
+        return { success: false, error: 'Please enter a valid email address.' };
+      }
+
       const config = getCurrentConfig();
       const redirectUrl = config.passwordResetUrl || `${window.location.origin}/reset-password`;
       
       console.log('Using password reset redirect URL:', redirectUrl);
       
-      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      // Check if redirect URL is properly configured
+      if (!redirectUrl || !redirectUrl.includes('reset-password')) {
+        console.warn('Password reset URL may not be properly configured:', redirectUrl);
+      }
+      
+      const { data, error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
         redirectTo: redirectUrl
       });
 
       if (error) {
         console.error('Password reset error:', error);
-        return { success: false, error: error.message };
+        console.error('Error code:', error.status);
+        console.error('Error message:', error.message);
+        
+        // Provide more specific error messages
+        let errorMessage = error.message;
+        
+        if (error.message?.includes('rate limit') || error.status === 429) {
+          errorMessage = 'Too many requests. Please wait a few minutes before trying again.';
+        } else if (error.message?.includes('invalid') || error.message?.includes('not found')) {
+          errorMessage = 'No account found with this email address.';
+        } else if (error.message?.includes('redirect') || error.message?.includes('URL')) {
+          errorMessage = 'Configuration error with reset link. Please contact support.';
+        } else if (error.message?.includes('email')) {
+          errorMessage = 'Invalid email address. Please check and try again.';
+        }
+        
+        return { success: false, error: errorMessage };
       }
 
+      // Note: Supabase returns success even if email doesn't exist (for security)
+      // But we check email existence before calling this function
       console.log('Password reset email sent successfully');
+      console.log('Response data:', data);
       return { success: true };
-    } catch (error) {
-      console.error('Password reset error:', error);
-      return { success: false, error: 'Failed to send password reset email. Please try again.' };
+    } catch (error: any) {
+      console.error('Password reset exception:', error);
+      return { success: false, error: error?.message || 'Failed to send password reset email. Please try again.' };
     }
   },
 
